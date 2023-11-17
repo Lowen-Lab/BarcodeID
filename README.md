@@ -33,9 +33,11 @@ The requirements to run this pipeline are:
    * For windows users, we recommend using [GitBash](https://git-scm.com/downloads). In our testing, WSL was not a reliable method to perform the analysis.
 	  * To use GitBash, the user will need to edit their *".bashrc" file in *"C:/Users/username"* to GitBash to add the location of their conda profile, the location of their python3 installation, and add the location of their bbtools installation to the GitBash path
 	     * An example of how you might edit your .bashrc file:
-> . /c/ProgramData/miniconda3/etc/profile.d/conda.sh
-> alias python="winpty /c/ProgramData/miniconda3/python.exe"
-> PATH=$PATH:"/c/ProgramData/bbmap"
+```
+. /c/ProgramData/miniconda3/etc/profile.d/conda.sh
+alias python="winpty /c/ProgramData/miniconda3/python.exe"
+PATH=$PATH:"/c/ProgramData/bbmap"
+```
 
 Required python packages:
 1. numpy
