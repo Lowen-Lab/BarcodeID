@@ -70,6 +70,7 @@ import os
 import sys
 import numpy as np
 import time
+import random
 
 ###################################### Establish variables #######################################
 project_dir = "./"
@@ -98,7 +99,7 @@ forward_read_suffix = "" #if empty, the script will attempt to predict these val
 reverse_read_suffix = "" #this value is ignored if 'reads_already_screened_for_quality' is 'True' or 'raw_read_input_type' is 'single' - NOTE: this variable cannot be removed without causing missing value errors
 
 parallel_process = True #'True' or 'False' --- when True, the script uses the joblib package to run multiple samples simultaneously. Currently not stable on windows
-parallel_max_cpu = -1 # when parallel process true, this sets the max CPUs the script is allowed to use. If you want to use all available, set to 0. If you want to use all but one, set to -1 (or -2 to use all but 2 CPUs)
+parallel_max_cpu = 10 # when parallel process true, this sets the max CPUs the script is allowed to use. If you want to use all available, set to 0. If you want to use all but one, set to -1 (or -2 to use all but 2 CPUs)
 
 global verbose
 verbose = True #when this value is 'True', the script will print status updates
@@ -621,17 +622,21 @@ def screen_barcode_site_qual(seq_in,qual_in,seq_expect,barcode_dict,min_barcode_
 	return total_mismatches,mismatch_sites,high_qual_mismatches
 
 
-def raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,amplicon_length,force_trim_pre_merge,truncate_length_post_merge):
+def raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge):
 	global verbose
 	if verbose == True:
 		update_print_line("Processing input reads",accession)
 	trim_fastq_filename = temp_dir+accession+".trim.fq"
 	clean_filename_out = trim_dir+accession+".fq"
-	command = command_prefix+'bbduk.sh in="'+raw_reads_forward+'" out="'+trim_fastq_filename+'" qin=33 maq=20 minlength='+str(amplicon_length)+' maxlength='+str(amplicon_length)+' overwrite=t'
-	out = run_command(command)
+	if detect_barcode_content_first == True or amplicon_length == 0:
+		read_len_expected = calc_expect_read_len(raw_reads_forward)
+	else:
+		read_len_expected = amplicon_length
+	command = command_prefix+'bbduk.sh in="'+raw_reads_forward+'" out="'+trim_fastq_filename+'" qin=33 maq=20 minlength='+str(read_len_expected)+' maxlength='+str(read_len_expected)+' overwrite=t'
+	out = run_command(command+ ' overwrite=t -Xmx1000m')
 	if out == False:
 		sys.exit()
-	time.sleep(5)
+	time.sleep(1)
 	os.rename(trim_fastq_filename,clean_filename_out)
 	return clean_filename_out
 
@@ -883,7 +888,7 @@ def reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,re
 			if raw_read_input_type == "paired":
 				processed_read_filename = raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_reads_reverse,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge)
 			elif raw_read_input_type == "single":
-				processed_read_filename = raw_read_processing_single(accession,command_prefix,raw_reads_forward,raw_reads_reverse,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge)
+				processed_read_filename = raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge)
 	elif reads_already_screened_for_quality == True:
 		processed_read_filename = raw_reads_forward
 
@@ -939,7 +944,10 @@ if forward_read_suffix == '':
 			if line[0] == "forward":
 				forward_read_suffix = line[1]
 			elif line[0] == "reverse":
-				reverse_read_suffix = line[1]
+				try:
+					reverse_read_suffix = line[1]
+				except:
+					reverse_read_suffix = ''
 			continue_running = True
 	except:
 		if raw_read_input_type == "paired" and reads_already_screened_for_quality == False:
@@ -1018,6 +1026,8 @@ detect_barcode_content_first = True
 amplicon_info_infile_path = project_dir+amplicon_info_infile_name
 if os.path.isfile(amplicon_info_infile_path):
 	expected_amplicon_seq,barcode_sites = load_barcode_info(project_dir+amplicon_info_infile_path)
+	# print(expected_amplicon_seq)
+	# print(barcode_sites)
 	if expected_amplicon_seq != "" and barcode_sites != {}:
 		detect_barcode_content_first = False
 else:
@@ -1031,7 +1041,8 @@ if detect_barcode_content_first == True:
 	accession_entered = input('Enter sample name for predicting barcode info (or "random" to pick random sample):\n')
 	temp_cont = False
 	if accession_entered == "random":
-		accession_list = [accession_list[0]]	
+		accession = accession_list[random.randint(0,len(accession_list))]
+		# accession_list = [accession_list[0]]	
 	elif accession_entered in sorted_accession_list:
 		accession = accession_entered
 	else:
@@ -1045,8 +1056,11 @@ if detect_barcode_content_first == True:
 	else:
 		sys.exit("Value entered is not a number")
 	raw_reads_forward = input_read_dir+accession+forward_read_suffix
-	raw_reads_reverse = input_read_dir+accession+reverse_read_suffix
-	processed_read_filename = raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_reads_reverse,trim_dir,temp_dir,detect_barcode_content_first,0,force_trim_pre_merge,truncate_length_post_merge)
+	if raw_read_input_type == "paired":
+		raw_reads_reverse = input_read_dir+accession+reverse_read_suffix
+		processed_read_filename = raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_reads_reverse,trim_dir,temp_dir,detect_barcode_content_first,0,force_trim_pre_merge,truncate_length_post_merge)
+	elif raw_read_input_type == "single":
+		processed_read_filename = raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,detect_barcode_content_first,0,force_trim_pre_merge,truncate_length_post_merge)
 	temp_seq_dict,temp_read_length = subset_fastq(processed_read_filename,10000,50000)
 	expected_amplicon_seq,barcode_sites = detect_barcode_content(temp_seq_dict,temp_read_length)
 	continue_running = False
