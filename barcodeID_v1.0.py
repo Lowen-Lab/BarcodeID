@@ -283,7 +283,6 @@ def detect_barcode_content(seq_dict,amplicon_length):
 					nt_count[cur_nt] += 1
 				except:
 					if seq[col] != "N":
-						skip_to_print_bottom()
 						sys.exit('Unexpected character found: "'+cur_nt+'" at site '+str(col))
 		nt_list = []
 		for nt in nt_count:
@@ -848,10 +847,6 @@ def update_print_line(string_in,accession):
 	global longest_accession_length
 	print(accession+" "*(longest_accession_length-len(accession))+" - "+string_in)
 
-def skip_to_print_bottom():
-	return None
-
-
 ##########################      Core pipeline function      ##########################
 
 def reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge):
@@ -1011,7 +1006,6 @@ for files in file_list:
 	accession_list.append(accession)
 accession_list = list(set(accession_list))
 
-# accession_list = ['VR-022_dil1_NA1','VR-023_dil2_NA1','VR-024_dil3_NA1','VR-026_dil5_NA1','VR-027_dil6_NA1','VR-028_dil7_NA1','VR-029_dil1_HA1-NA1','VR-030_dil2_HA1-NA1','VR-031_dil3_HA1-NA1','VR-032_dil4_HA1-NA1','VR-033_dil5_HA1-NA1','VR-034_dil6_HA1-NA1','VR-035_dil7_HA1-NA1']
 sorted_accession_list = sorted(accession_list)
 print_line_dict = {}
 longest_accession_length = 0
@@ -1042,7 +1036,6 @@ if detect_barcode_content_first == True:
 	temp_cont = False
 	if accession_entered == "random":
 		accession = accession_list[random.randint(0,len(accession_list))]
-		# accession_list = [accession_list[0]]	
 	elif accession_entered in sorted_accession_list:
 		accession = accession_entered
 	else:
@@ -1094,14 +1087,13 @@ if detect_barcode_content_first == True:
 	outfile.close()
 
 	if expected_amplicon_seq == "" or barcode_sites == {} or continue_running == False:
-		skip_to_print_bottom()
 		clean_files_for_one_sample(accession,output_dir,trim_dir)
 		sys.exit("\n\nExiting.")
 
 ### Process all samples
 processed_list = []
 if parallel_process == True:
-	processed_list = Parallel(n_jobs=num_cores, prefer="threads")(delayed(reads_to_barcodes_one_sample)(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge) for accession in accession_list)
+	processed_list = Parallel(n_jobs=num_cores)(delayed(reads_to_barcodes_one_sample)(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge) for accession in accession_list)
 elif parallel_process == False:
 	for accession in accession_list:
 		barcode_tup = reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge)
@@ -1246,7 +1238,6 @@ for site in range(0,len(expected_amplicon_seq)):
 			table_outfile.write("\n")
 table_outfile.close()
 
-# if detect_barcode_content_first == False:
 print("Calculating alpha-diversity indicies")
 alpha_div_outfile = open(output_dir+"all_barcode.alpha_diversity.txt","w")
 alpha_div_outfile.write("sampleID\tshannon_div\tsimpson_div\tchao_richness\tshannon_evenness\n")
