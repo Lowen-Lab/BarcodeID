@@ -10,7 +10,7 @@ It is written to perform barcoded amplicon sequence analysis for the Lowen Lab's
 
 In it's simplest use case, the user can put their compressed sequence files in a folder named "raw_data" and immediately start the analysis by entering:
 ```
-python barcodeID_v1.0.py
+python barcodeID.py
 ```
 in the appropriate terminal and following the text prompts for required information.
 
@@ -41,13 +41,19 @@ PATH=$PATH:"/c/ProgramData/bbmap"
 
 Required python packages:
 1. numpy
-2. multiprocessing
-3. joblib
+2. scipy
+3. pandas
+4. matplotlib
+5. multiprocessing
+6. joblib
 
    * Using conda, these packages can be installed using the following conda commands:
       - conda install numpy
-	  - conda install multiprocess
-	  - conda install joblib
+      - conda install scipy
+      - conda install pandas
+      - conda install matplotlib
+      - conda install multiprocess
+      - conda install joblib
 
 While *multiprocessing* and *joblib* are not necessary for single-core processing, they are highly recommend not only because parallel processing is substantially faster and can scale with the number of cores available, but the single core processing option has not been as rigorously tested as the parallel processing option.
 
