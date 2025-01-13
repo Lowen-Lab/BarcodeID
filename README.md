@@ -4,7 +4,9 @@
 
 This script is designed to take in amplicon sequences that have nucleotide barcodes at specific sites. There is no minimum or maximum number of barcodes, but this script currently only permits two possible nucleotides per site (e.g. a barcode at site 33 can be either A or T, but not C or G). This script process the illumina sequence files to generate tables that summarize the frequency of all barcodes detected in each sample, as well as reporting alpha and beta diversity indicies for those samples.
 
-It is written to perform barcoded amplicon sequence analysis for the Lowen Lab's influenza research, but it should work just as well with any barcoded amplicon library with a similar design. 
+A key feature of barcodeID is that it performs error correction to substantially reduce the influence of spurrious errors from impacting the results. BarcodeID does this by creating an error model of all nucleotide substitions from all non-barcoded sites, then using an agglomerative correction algorithm to identify erroneous barcode sequences based on the method employed by DADA2 (PMID: 27214047). To account for differences in sampling intensity between samples, barcodeID performs subsampling of all barcodes at multiple levels, then uses linear regression to calculate alpha and beta diversity statistics.
+
+It is written to perform barcoded amplicon sequence analysis for the Lowen Lab's influenza research, but it should work just as well with any barcoded amplicon library with biallelic sites. 
 
 # How to use this script
 
@@ -31,27 +33,22 @@ The requirements to run this pipeline are:
 4. Bash (also required to run BBTools)
    * This is available by default on Mac and Linus operating systems
    * For windows users, we recommend using [GitBash](https://git-scm.com/downloads). In our testing, WSL was not a reliable method to perform the analysis.
-	  * To use GitBash, the user will need to edit their *".bashrc" file in *"C:/Users/username"* to GitBash to add the location of their conda profile, the location of their python3 installation, and add the location of their bbtools installation to the GitBash path
-	     * An example of how you might edit your .bashrc file:
-```
-. /c/ProgramData/miniconda3/etc/profile.d/conda.sh
-alias python="winpty /c/ProgramData/miniconda3/python.exe"
-PATH=$PATH:"/c/ProgramData/bbmap"
-```
+      * To use GitBash, the user will need to edit their *".bashrc" file in *"C:/Users/username"* to GitBash to add the location of their conda profile, the location of their python3 installation, and add the location of their bbtools installation to the GitBash path
+         * An example of how you might edit your .bashrc file:
+> . /c/ProgramData/miniconda3/etc/profile.d/conda.sh
+> alias python="winpty /c/ProgramData/miniconda3/python.exe"
+> PATH=$PATH:"/c/ProgramData/bbmap"
 
 Required python packages:
 1. numpy
 2. scipy
 3. pandas
-4. matplotlib
-5. multiprocessing
-6. joblib
-
+4. multiprocessing
+5. joblib
    * Using conda, these packages can be installed using the following conda commands:
       - conda install numpy
       - conda install scipy
       - conda install pandas
-      - conda install matplotlib
       - conda install multiprocess
       - conda install joblib
 
@@ -67,7 +64,7 @@ Output files are generated in the folder *"./barcode_info/"*
       * A barcode frequency table for all samples
    3. *"all_mismatch_info.table.txt"*
       * A table that shows the frequency at which reads were discarded for having an unexpected nucleotide while also passing the user specified quality threshold
-	  * This table is a very useful tool for determining if reads are being discarded erroneously, or if there are non-barcode alleles sweeping your samples through positive selection
+      * This table is a very useful tool for determining if reads are being discarded erroneously, or if there are non-barcode alleles sweeping your samples through positive selection
    4. *"all_nonbarcode_freq.table.txt"*
       * A table showing the frequency of unexpected alleles in your samples across all reads
    5. *all_barcode.alpha_diversity.txt*
