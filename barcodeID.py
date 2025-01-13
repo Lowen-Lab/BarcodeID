@@ -1,5 +1,5 @@
 '''
-barcoded amplicon processing pipeline - v1.1
+barcoded amplicon processing pipeline - v1.2
 ###################################################################################################
 #####################################    About this script    #####################################
 ###################################################################################################
@@ -65,6 +65,7 @@ correct, or enter the correct values. All remaining samples will then be process
 10/06/2023 - v0.6 - Added function to trim ends of reads to skip low quality ends
 11/17/2023 - v1.0 - First publicly available version
 04/25/2024 - v1.1 - Added generation of stacked bar plot figures and improved file suffix prediction
+10/07/2024 - v1.2 - Added barcode quality correction and agglomeration (similar to DADA2 for 16S)
 '''
 ###################################### Load required modules ######################################
 import os
@@ -89,11 +90,11 @@ command_prefix = "bash "
 ##################################  USER DEFINED VARIABLES  #######################################
 ###################################################################################################
 input_read_dir = project_dir+"raw_data/"
-min_qual_backbone = 25
-min_qual_barcode_sites = 30
+
 amplicon_info_infile_name = 'amplicon_info.txt'
 titer_filename = 'sample_titers.txt' #this file is not necessary, but can be added to scale stacked box plots to log10 transformed viral titers. Tab separated file, one sample per line: sampleID \t titer \n
 
+min_Q_score = 20
 F_edge_ignore = 0 #these values are used to exclude the edge of reads if their quality is low and needlessly discarding excessive data due to sequencing quality issues
 R_edge_ignore = 0 #these values are used to exclude the edge of reads if their quality is low and needlessly discarding excessive data due to sequencing quality issues
 force_trim_pre_merge = 0 #use this value to force trimming the first x nucleotides from input reads, which is helpful when the beginning of reads are low quality
@@ -104,21 +105,27 @@ generate_stacked_bar_plots = True #when True, stacked bar plots will be generate
 
 reads_already_screened_for_quality = False # 'True' or 'False' --- If reads were already merged and screened for average quality and length (such as during a demultiplexing step), the script will not attempt to filter or merge the input reads
 raw_read_input_type = "paired" # 'paired' or 'single' --- When 'single' the pipeline will look for barcodes in one file, when 'paired' the pipeline will look for forward and reverse reads. Single core use has not been extensively tested - recommend using "paired" and setting "parallel_max_cpu" to 1 if you only wish to use one core at a time
-forward_read_suffix = "" #if empty, the script will attempt to predict these values, but it only works under specific assumptions
-reverse_read_suffix = "" #this value is ignored if 'reads_already_screened_for_quality' is 'True' or 'raw_read_input_type' is 'single' - NOTE: this variable cannot be removed without causing missing value errors
+forward_read_suffix = "_R1.fastq" #if empty, the script will attempt to predict these values, but it only works under specific assumptions
+reverse_read_suffix = "_R2.fastq" #this value is ignored if 'reads_already_screened_for_quality' is 'True' or 'raw_read_input_type' is 'single' - NOTE: this variable cannot be removed without causing missing value errors
 
 parallel_process = True #'True' or 'False' --- when True, the script uses the joblib package to run multiple samples simultaneously. Currently not stable on windows
-parallel_max_cpu = 40 # when parallel process true, this sets the max CPUs the script is allowed to use. If you want to use all available, set to 0. If you want to use all but one, set to -1 (or -2 to use all but 2 CPUs)
+parallel_max_cpu = 150 # when parallel process true, this sets the max CPUs the script is allowed to use. If you want to use all available, set to 0. If you want to use all but one, set to -1 (or -2 to use all but 2 CPUs)
 
 global verbose
 verbose = True #when this value is 'True', the script will print status updates
 
+num_subsamples = 5 #number of times barcode counts should be subsampled to calculate diversity indicies
+min_barcodes_per_sample = 4000 #non-unique barcode counts that pass processing to be included in final output tables and statistics
 ############################################ FUNCTIONS ############################################
-def run_command(command):
+def run_command(command,mode="quiet"):
+# def run_command(command,mode="verbose"):
 	run_status = False
-	# return_code = os.system(command)  #unhash this line and hash out the line below if you wish to see all updated output from command line applications for troubleshooting
-	return_code = os.system(command+" >/dev/null 2>&1")
-	if return_code == 0: #if return_code is something other than zero, python was not able to successfully run your analysis
+	if mode == "verbose":
+		return_code = os.system(command)
+	elif mode == "quiet":
+		return_code = os.system(command+" >/dev/null 2>&1")
+	# subprocess.check_output(command,stderr=subprocess.STDOUT)
+	if return_code == 0:
 		run_status = True
 	return run_status
 
@@ -278,26 +285,55 @@ def predict_single_file_extension(input_dir):
 def detect_barcode_content(seq_dict,amplicon_length):
 	amplicon_expect = ''
 	barcode_sites = {}
+	nts = ['A','T','C','G']
+	prop_lineout = 'loc\tA\tT\tC\tG\n'
+	minor_freq_list = []
+	minor_freq_loc_list = []
 	for col in range(0,amplicon_length):
-		nt_count = {'A':0,'T':0,'C':0,'G':0}
+		prop_lineout += str(col)
+		nt_count_dict = {'A':0,'T':0,'C':0,'G':0}
 		for seq in seq_dict:
 			if len(seq) == amplicon_length:
 				try:
 					cur_nt = seq[col]
-					nt_count[cur_nt] += 1
+					nt_count_dict[cur_nt] += 1
 				except:
 					if seq[col] != "N":
 						sys.exit('Unexpected character found: "'+cur_nt+'" at site '+str(col))
 		nt_list = []
-		for nt in nt_count:
-			temp_tup = (nt_count[nt],nt)
+		for n in range(0,len(nts)):
+			nt = nts[n]
+			nt_counted = nt_count_dict[nt]
+			nt_prop = float(nt_counted)/float(len(seq_dict))
+			prop_lineout += '\t'+str(nt_prop)
+			temp_tup = (nt_count_dict[nt],nt)
 			nt_list.append(temp_tup)
 		nt_list = sorted(nt_list, reverse=True)
-		if float(nt_list[0][0])/float(len(seq_dict)) >= 0.7:
-			amplicon_expect += nt_list[0][1]
+		major_allele = nt_list[0][1]
+		minor_allele = nt_list[1][1]
+		major_freq = float(nt_list[0][0])/float(len(seq_dict))
+		minor_freq = float(nt_list[1][0])/float(len(seq_dict))
+		minor_freq_list.append(minor_freq)
+		loc_tup = (minor_freq,col,(major_allele,minor_allele))
+		minor_freq_loc_list.append(loc_tup)
+		prop_lineout += '\n'
+	outfile = open(project_dir+"barcode_predict_info.txt","w")
+	outfile.write(prop_lineout)
+	outfile.close()
+	
+	amplicon_expect = "N"*amplicon_length
+	minor_freq_loc_list = sorted(minor_freq_loc_list,reverse=True)
+	med_freq = np.median(minor_freq_list)
+	for i in range(0,len(minor_freq_loc_list)):
+		local_freq = minor_freq_loc_list[i][0]
+		loc = minor_freq_loc_list[i][1]
+		allele_tup = minor_freq_loc_list[i][2]
+		if (local_freq/med_freq)>=10 and local_freq >= 0.03:
+			barcode_sites[loc] = [allele_tup[0],allele_tup[1]]
+			# amplicon_expect += "N"
 		else:
-			amplicon_expect += "N"
-			barcode_sites[col] = [nt_list[0][1],nt_list[1][1]]
+			amplicon_expect = amplicon_expect[0:loc]+allele_tup[0]+amplicon_expect[loc+1:amplicon_length]
+			# amplicon_expect[loc] = allele_tup[0]
 	return amplicon_expect, barcode_sites
 
 
@@ -416,11 +452,83 @@ def fastq_to_fasta(filename_in,filename_out):
 	outfile.close()
 	return filename_out
 
+def pull_qual_info(input_seq_filename,max_read_count=1e6,min_qual_count=20):
+	flank_ignore = 0
+	infile = open(input_seq_filename,"r")
+	line_counter = -1
+	read_count = 0
+	qual_sub_dict = {}
+	loc_sub_dict = {}
+	sub_per_read_dict = {}
+	keep_reading = True
+	for line in infile:
+		line = line.strip()
+		line_counter += 1
+		if line_counter == 0:
+			head = line
+			read_count += 1
+			if read_count == max_read_count:
+				keep_reading = False
+		elif line_counter == 1:
+			nt_string = line
+			nt_string = nt_string[0:len(nt_string)-flank_ignore]
+		elif line_counter == 3:
+			if keep_reading == True:
+				line_counter = -1
+			phreds = line
+			phreds = phreds[0:len(phreds)-flank_ignore]
+			read_sub_info = []
+			mismatch_count = 0
+			lowQ_count = 0
+			if len(nt_string)==len(expected_amplicon_seq):
+				for loc in range(0,len(nt_string)):
+					backbone_nt = ''
+					expected_nts = {}
+					site_type = ''
+					try:
+						expected_nts = barcode_sites[loc]
+						site_type = "barcode"
+					except:
+						expected_nts[expected_amplicon_seq[loc]] = ''
+						backbone_nt = expected_amplicon_seq[loc]
+						site_type = "backbone"
+					if site_type == "backbone":
+						nt = nt_string[loc]
+						qu = ord(phreds[loc])-33
+						sub_tup = (backbone_nt,nt,qu,loc)
+						if qu >= min_qual_count:
+							read_sub_info.append(sub_tup)
+							if nt != backbone_nt:
+								mismatch_count += 1
+						else:
+							lowQ_count += 1
+				try:
+					sub_per_read_dict[mismatch_count] += 1
+				except:
+					sub_per_read_dict[mismatch_count] = 1
+				if mismatch_count <= 2 and lowQ_count == 0:
+					for sub_tup in read_sub_info:
+						backbone_nt = sub_tup[0]
+						sub_nt = sub_tup[1]
+						qu = sub_tup[2]
+						loc = sub_tup[3]
+						try:
+							qual_sub_dict[backbone_nt][sub_nt][qu] += 1
+						except:
+							try:
+								qual_sub_dict[backbone_nt][sub_nt][qu] = 1
+							except:
+								try:
+									qual_sub_dict[backbone_nt][sub_nt] = {}
+									qual_sub_dict[backbone_nt][sub_nt][qu] = 1
+								except:
+									qual_sub_dict[backbone_nt] = {}
+									qual_sub_dict[backbone_nt][sub_nt] = {}
+									qual_sub_dict[backbone_nt][sub_nt][qu] = 1
+	output_tup = (input_seq_filename.split(".f")[0],qual_sub_dict,sub_per_read_dict)
+	return output_tup
 
 def read_in_barcodes(barcode_filename_in,mismatch_filename_in,nonbarcode_filename_in):
-	# global verbose
-	# if verbose == True:
-	# 	update_print_line("Reading in barcodes",accession)
 	barcode_count_dict = {}
 	barcode_list = []
 	infile = open(barcode_filename_in)
@@ -443,19 +551,7 @@ def read_in_barcodes(barcode_filename_in,mismatch_filename_in,nonbarcode_filenam
 			prop = float(line[1])
 			mismatch_by_site[site] = prop
 	infile.close()
-
-	high_qual_nonbarcode_dict = {}
-	infile = open(nonbarcode_filename_in)
-	for line in infile:
-		line = line.strip().split("\t")
-		if line[0] != "non-barcode_seq":
-			seq = line[0]
-			count = int(line[1])
-			high_qual_nonbarcode_dict[seq] = count
-	infile.close()
-	# if verbose == True:
-	# 	update_print_line("Finished reading barcodes",accession)
-	return barcode_count_dict, barcode_list,mismatch_by_site,high_qual_nonbarcode_dict
+	return barcode_count_dict, barcode_list,mismatch_by_site
 
 
 def shannon_alpha(freq_array):
@@ -466,10 +562,13 @@ def shannon_alpha(freq_array):
 			H_i = -1*freq*np.log(freq)
 			H += H_i
 			S_obs += 1
-	H_max = np.log(S_obs)
-	E = H/H_max
-	H = round(H,3)
-	E = float(round_to_n_sig_figs(E,3))
+	if S_obs >1:
+		H_max = np.log(S_obs)
+		E = H/H_max
+		H = round(H,3)
+		E = float(round_to_n_sig_figs(E,3))
+	else:
+		H,E = 0,0
 	return H,E
 
 def simpson_alpha(freq_array):
@@ -480,7 +579,7 @@ def simpson_alpha(freq_array):
 			S += 1
 			p_sum += freq**2
 	H = p_sum
-	return round_to_n_sig_figs(H,3)
+	return float(round_to_n_sig_figs(H,3))
 
 def bray_curtis_dissimilarity_log(array1,array2):
 	C,S1,S2 = 0,0,0
@@ -496,7 +595,7 @@ def bray_curtis_dissimilarity_log(array1,array2):
 		if val2 > 0.0:
 			S2 += 1/(-1*np.log(val2))
 	B = 1-((2*C)/(S1+S2))
-	return round_to_n_sig_figs(B,3)
+	return float(round_to_n_sig_figs(B,3))
 
 def bray_curtis_dissimilarity(array1,array2):
 	C,S1,S2 = 0,0,0
@@ -510,26 +609,29 @@ def bray_curtis_dissimilarity(array1,array2):
 		if val2 > 0.0:
 			S2 += val2
 	B = 1-((2*C)/(S1+S2))
-	return round_to_n_sig_figs(B,3)
+	return float(round_to_n_sig_figs(B,3))
 
-def jaccard_dissimilarity(array1,array2,min_freq=0.0):
+def jaccard_dissimilarity(array1,array2,min_count=1.0):
 	AB,A,B,C = 0,0,0,0
 	for i in range(0,len(array1)):
 		val1 = array1[i]
 		val2 = array2[i]
-		if val1 > min_freq or val2 > min_freq:
+		if val1 >= min_count or val2 >= min_count:
 			C += 1
-		if val1 > min_freq and val2 > min_freq:
+		if val1 >= min_count and val2 >= min_count:
 			AB += 1
-	J = 1 - (AB/C)
-	return round_to_n_sig_figs(J,3)
+	if C == 0:
+		j = 1.
+	else:
+		J = 1. - (AB/C)
+	return float(round_to_n_sig_figs(J,3))
 
-def chao_1_richness(count_array):
+def chao_1_richness(count_array,min_count=1):
 	S_obs = 0
 	S_single = 0
 	S_double = 0
 	for count in count_array:
-		if count >0:
+		if count >= min_count:
 			S_obs += 1
 			if count == 1:
 				S_single += 1
@@ -538,6 +640,14 @@ def chao_1_richness(count_array):
 	S_unobs = (S_single*(S_single-1))/(2*S_double+1)
 	R = S_obs + S_unobs
 	return round(R,1)
+
+def true_richness(count_array,min_count=1):
+	t_rich = 0
+	for i in range(0,len(count_array)):
+		count = count_array[i]
+		if count >= min_count:
+			t_rich += 1
+	return t_rich
 
 def is_number(n):
 	try:
@@ -551,27 +661,383 @@ def round_to_n_sig_figs(val,num_sig_figs):
 		val = float(val)
 		if val == 0.0:
 			return '0.0'
-		num_sig_figs = int(num_sig_figs)
-		if num_sig_figs == 0:
-			num_sig_figs = 1
-		sci_val = "{:.10e}".format(val)
-		split_sci_val = sci_val.split("e")
-		if len(split_sci_val) == 2:
-			rounded_base_number = round(float(split_sci_val[0]),num_sig_figs-1)
-			exponent = int(split_sci_val[1])
-			if exponent == 0:
-				val_out = str(rounded_base_number) + ((num_sig_figs)-1)*'0'
-			elif exponent < 0:
-				exponent*=-1
-				val_out = '0.' + (exponent-1)*'0' + str(rounded_base_number).replace(".","")
-				val_out = str(float(val_out))
-			elif exponent > 0:
-				val_out = str(rounded_base_number) +'e'+ (str(exponent))
-			return val_out
+		elif is_number(num_sig_figs):
+			if val<0:
+				multiplier = -1
+			else:
+				multiplier = 1
+			val = val*multiplier
+			num_sig_figs = float(num_sig_figs)
+			if num_sig_figs.is_integer:
+				num_sig_figs = int(num_sig_figs)
+				if num_sig_figs == 0:
+					num_sig_figs = 1
+				sci_val = "{:.10e}".format(val)
+				split_sci_val = sci_val.split("e")
+				if len(split_sci_val) == 2:
+					rounded_base_number = round(float(split_sci_val[0]),num_sig_figs-1)
+					exponent = int(split_sci_val[1])
+					if str(rounded_base_number) == '10.0':
+						val_out = str(round(float(val),num_sig_figs))
+					elif exponent == 0:
+						val_out = str(rounded_base_number) + ((num_sig_figs)-1)*'0'
+					elif exponent < 0:
+						exponent*=-1
+						val_out = '0.' + (exponent-1)*'0' + str(rounded_base_number).replace(".","")
+						if exponent >3:
+							val_out = str(float(val_out))
+						elif len(val_out) >7:
+							val_out = str(float(val_out))
+					elif exponent > 0:
+						val_out = str(rounded_base_number) +'e'+ (str(exponent))
+					else:
+						sys.exit("Unexpected error while rounding: "+str(val))
+					if multiplier == -1:
+						val_out = '-'+val_out
+					return val_out
+			else:
+				sys.exit("Non-integer value for 'num_sig_figs' provided: "+str(num_sig_figs))
 		else:
-			return val
+			sys.exit("Unable to round: '"+str(val) + "' to: '"+str(num_sig_figs)+"' decimals")
 	else:
-		return val
+		sys.exit("Unable to round: '"+str(val) + "' to: '"+str(num_sig_figs)+"' decimals")
+
+def rsquared(x, y):
+	slope, intercept, r_value, p_value, std_err = scipy.stats.linregress(x, y)
+	return r_value**2
+
+def subsample_counts(count_array,barcodeID_array,num_to_pick):
+	num_to_pick = int(num_to_pick)
+	rand_list = []
+	for i in range(0,len(count_array)):
+		count = count_array[i]
+		barcodeID = barcodeID_array[i]
+		if count >1:
+			for j in range(0,count):
+				rand_list.append(barcodeID)
+	random.shuffle(rand_list)
+	subset_list = rand_list[0:num_to_pick]
+	count_dict_out = {}
+	freq_dict_out = {}
+	for i in range(0,len(subset_list)):
+		barcodeID = subset_list[i]
+		try:
+			count_dict_out[barcodeID] += 1
+		except:
+			count_dict_out[barcodeID] = 1
+	local_barcodeID_list = list(count_dict_out.keys())
+	float_num_to_pick = float(num_to_pick)
+	for i in range(0,len(local_barcodeID_list)):
+		barcodeID = local_barcodeID_list[i]
+		count = count_dict_out[barcodeID]
+		barocde_freq = float(count)/float_num_to_pick
+		freq_dict_out[barcodeID] = barocde_freq
+	return count_dict_out,freq_dict_out
+
+def subsample_alpha_func(input_tup,full_barcode_list,subsample_iterations=3):
+	sampleID = input_tup[0]
+	counts = input_tup[1]
+	sample_total = np.sum(counts)
+	pick_set_list = [1.e3,2.e3,4.e3,8.e3,1e4,2.e4,3e4,4.e4,5e4,6e4,7e4,8e4,9e4,1e5,2e5,4e5,8e5,1e6,2e6]
+	diversity_dict = {}
+	for s in range(0,len(pick_set_list)):
+		subsample_size = pick_set_list[s]
+		if sample_total >= subsample_size:
+			diversity_dict[subsample_size] = {}
+			for iter_num in range(0,subsample_iterations):
+				rand_count_dict,rand_freq_dict = subsample_counts(counts,full_barcode_list,subsample_size)
+				rand_count = []
+				rand_freq = []
+				local_barcode_list = []
+				for b in range(0,len(full_barcode_list)):
+					barcodeID = full_barcode_list[b]
+					try:
+						count = rand_count_dict[barcodeID]
+					except:
+						count = 0
+					try:
+						freq = rand_freq_dict[barcodeID]
+					except:
+						freq = 0
+					if count > 0:
+						local_barcode_list.append(barcodeID)
+						rand_count.append(count)
+						rand_freq.append(freq)
+				local_shannon,local_even = shannon_alpha(rand_freq)
+				local_simpson = simpson_alpha(rand_freq)
+				local_chao = chao_1_richness(rand_count)
+				try:
+					diversity_dict[subsample_size]['shannon'].append(local_shannon)
+					diversity_dict[subsample_size]['simpson'].append(local_simpson)
+					diversity_dict[subsample_size]['even'].append(local_even)
+					diversity_dict[subsample_size]['chao'].append(local_chao)
+					diversity_dict[subsample_size]['rich'].append(int(len(local_barcode_list)))
+				except:
+					diversity_dict[subsample_size]['shannon'] = [local_shannon]
+					diversity_dict[subsample_size]['simpson'] = [local_simpson]
+					diversity_dict[subsample_size]['even'] = [local_even]
+					diversity_dict[subsample_size]['chao'] = [local_chao]
+					diversity_dict[subsample_size]['rich'] = [int(len(local_barcode_list))]
+	subsample_count_list = list(diversity_dict.keys())
+	subsample_count_list = sorted(subsample_count_list)
+	median_diversity_dict = {}
+	for s in range(0,len(subsample_count_list)):
+		subsample_size = subsample_count_list[s]
+		shannon_med = np.median(diversity_dict[subsample_size]['shannon'])
+		simpson_med = np.median(diversity_dict[subsample_size]['simpson'])
+		even_med = np.median(diversity_dict[subsample_size]['even'])
+		chao_med = np.median(diversity_dict[subsample_size]['chao'])
+		rich_med = np.median(diversity_dict[subsample_size]['rich'])
+		try:
+			median_diversity_dict['shannon'].append(shannon_med)
+			median_diversity_dict['simpson'].append(simpson_med)
+			median_diversity_dict['even'].append(even_med)
+			median_diversity_dict['chao'].append(chao_med)
+			median_diversity_dict['rich'].append(rich_med)
+		except:
+			median_diversity_dict['shannon'] = [shannon_med]
+			median_diversity_dict['simpson'] = [simpson_med]
+			median_diversity_dict['even'] = [even_med]
+			median_diversity_dict['chao'] = [chao_med]
+			median_diversity_dict['rich'] = [rich_med]
+	fit_div_dict = {}
+	if median_diversity_dict != {}:
+		if len(median_diversity_dict['shannon']) >= 3:
+			fit_div_dict['shannon'] = float(round_to_n_sig_figs(fit_alpha(median_diversity_dict['shannon'],subsample_count_list),4))
+			fit_div_dict['simpson'] = float(round_to_n_sig_figs(fit_alpha(median_diversity_dict['simpson'],subsample_count_list),4))
+			fit_div_dict['even'] = float(round_to_n_sig_figs(fit_alpha(median_diversity_dict['even'],subsample_count_list),4))
+			fit_div_dict['chao'] = float(round_to_n_sig_figs(np.exp(fit_alpha(np.log(median_diversity_dict['chao']),subsample_count_list)),4))
+			fit_div_dict['rich'] = float(round_to_n_sig_figs(np.exp(fit_alpha(np.log(median_diversity_dict['rich']),subsample_count_list)),4))
+	out_tup = (sampleID,diversity_dict,fit_div_dict)
+	return out_tup
+
+def fit_alpha(alpha_vals,sub_num_list,poly_num=2,subsample_fit_level=1e4):
+	sub_num_list = np.log(sub_num_list)
+	poly_coeff = np.polyfit(sub_num_list,alpha_vals,2)
+	poly_func = np.poly1d(poly_coeff)
+	subsample_fit = poly_func(np.log(subsample_fit_level))
+	return subsample_fit
+	# min_rsquare = 0.95
+	# poly_rsq = rsquared(alpha_vals,poly_func(sub_num_list))
+	# if poly_rsq < min_rsquare:
+	# 	return 0
+	# subsample_fit = float(round_to_n_sig_figs(subsample_fit,4))
+	# poly_rsq = float(round_to_n_sig_figs(poly_rsq,4))
+
+def subsample_beta_func(input_tup,full_barcode_list,subsample_iterations=3,subsample_fit_level=1e4):
+	sample_tup_1 = input_tup[0]
+	sample_tup_2 = input_tup[1]
+	sample_1,counts_1 = sample_tup_1[0],sample_tup_1[1]
+	sample_2,counts_2 = sample_tup_2[0],sample_tup_2[1]
+	sample_total_1 = np.sum(counts_1)
+	sample_total_2 = np.sum(counts_2)
+	
+	# pick_set_list = [5e2,1e3,2e3,4e3,8e3,1.6e4,3.2e4,6.4e4,1.28e5]
+	# pick_set_list = [4e3,6e3,8e3,1e4,2e4,3e4,4e4,5e4,6e4,8e4]
+	pick_set_list = [8e3,1e4,2e4,4e4]
+
+	dissimilarty_dict = {}
+	for s in range(0,len(pick_set_list)):
+		subsample_size = pick_set_list[s]
+		if sample_total_1 >= subsample_size and sample_total_2 >= subsample_size:
+			dissimilarty_dict[subsample_size] = {}
+			for iter_num in range(0,subsample_iterations):
+				rand_count_dict_1,rand_freq_dict_1 = subsample_counts(counts_1,full_barcode_list,subsample_size)
+				rand_count_dict_2,rand_freq_dict_2 = subsample_counts(counts_2,full_barcode_list,subsample_size)
+				rand_count_1 = []
+				rand_count_2 = []
+				rand_freq_1 = []
+				rand_freq_2 = []
+				local_barcode_list = []
+				for b in range(0,len(full_barcode_list)):
+					barcodeID = full_barcode_list[b]
+					try:
+						count1 = rand_count_dict_1[barcodeID]
+					except:
+						count1 = 0
+					try:
+						count2 = rand_count_dict_2[barcodeID]
+					except:
+						count2 = 0
+					try:
+						freq1 = rand_freq_dict_1[barcodeID]
+					except:
+						freq1 = 0
+					try:
+						freq2 = rand_freq_dict_2[barcodeID]
+					except:
+						freq2 = 0
+					if count1 >0 or count2 >0:
+						local_barcode_list.append(barcodeID)
+						rand_count_1.append(count1)
+						rand_count_2.append(count2)
+						rand_freq_1.append(freq1)
+						rand_freq_2.append(freq2)
+				local_bray_dist = bray_curtis_dissimilarity(rand_freq_1,rand_freq_2)
+				local_jaccard_dist = jaccard_dissimilarity(rand_count_1,rand_count_2)
+				try:
+					dissimilarty_dict[subsample_size]['bray'].append(local_bray_dist)
+					dissimilarty_dict[subsample_size]['jaccard'].append(local_jaccard_dist)
+				except:
+					dissimilarty_dict[subsample_size]['bray'] = [local_bray_dist]
+					dissimilarty_dict[subsample_size]['jaccard'] = [local_jaccard_dist]
+	subsample_count_list = list(dissimilarty_dict.keys())
+	subsample_count_list = sorted(subsample_count_list)
+	median_dissimilarty_dict = {}
+	for s in range(0,len(subsample_count_list)):
+		subsample_size = subsample_count_list[s]
+		bray_med = np.median(dissimilarty_dict[subsample_size]['bray'])
+		jaccard_med = np.median(dissimilarty_dict[subsample_size]['jaccard'])
+		try:
+			median_dissimilarty_dict['bray'].append(bray_med)
+			median_dissimilarty_dict['jaccard'].append(jaccard_med)
+		except:
+			median_dissimilarty_dict['bray'] = [bray_med]
+			median_dissimilarty_dict['jaccard'] = [jaccard_med]
+	fit_diss_dict = {}
+	try:
+		num_med = len(median_dissimilarty_dict['bray'])
+	except:
+		num_med = 0
+	if num_med >=3:
+		bray_list = median_dissimilarty_dict['bray']#[max(0,len(median_dissimilarty_dict['bray'])-8):len(median_dissimilarty_dict['bray'])]
+		bray_count_list = subsample_count_list#[max(0,len(median_dissimilarty_dict['bray'])-8):len(median_dissimilarty_dict['bray'])]
+		jaccard_list = median_dissimilarty_dict['jaccard']#[max(0,len(median_dissimilarty_dict['jaccard'])-8):len(median_dissimilarty_dict['jaccard'])]
+		jaccard_count_list = subsample_count_list
+		fit_diss_dict['bray'] = float(round_to_n_sig_figs(fit_alpha(bray_list,bray_count_list,1,subsample_fit_level),4))
+		fit_diss_dict['jaccard'] = float(round_to_n_sig_figs(fit_alpha(jaccard_list,jaccard_count_list,1,subsample_fit_level),4))
+	out_tup = (sample_1,sample_2,dissimilarty_dict,fit_diss_dict)
+	return out_tup
+
+
+def fit_qual_model(prop_sub_infile_name,count_sub_infile_name,fit_prop_sub_outfile_name,min_qual_val_to_fit=20,poly_num=1):
+	fit_sub_dict = {}
+	min_qual_obs = 999
+	max_qual_obs = -1
+	num_col = 2
+	num_row = 2
+	col = -1 #column
+	row = -1 #row
+	# fig_num = 0
+	focal_nt_obs_dict = {}
+	nt_count_dict = {}
+	count_sub_infile = open(count_sub_infile_name,"r")
+	first_line = True
+	for line in count_sub_infile:
+		line = line.rstrip('\n').split("\t")
+		if first_line == True:
+			qual_list = line
+			first_line = False
+		else:
+			base_nt = line[0]
+			sub_nt = line[1]
+			for a in range(2,len(line)):
+				qual_val = int(qual_list[a])
+				count_val = int(line[a])
+				try:
+					focal_nt_obs_dict[base_nt+str(qual_val)] += count_val
+				except:
+					focal_nt_obs_dict[base_nt+str(qual_val)] = count_val
+
+				try:
+					nt_count_dict[base_nt+sub_nt+str(qual_val)] += count_val
+				except:
+					nt_count_dict[base_nt+sub_nt+str(qual_val)] = count_val
+	count_sub_infile.close()
+
+	bases = ['A','T','C','G']
+	qual_val_list = {}
+
+	for p in range(0,len(bases)):
+		focal_nt = bases[p]
+		col+=1
+		if col%num_col==0:
+			row+=1
+			col = 0
+		for h in range(0,len(bases)):
+			focal_sub_nt = bases[h]
+			prop_sub_infile = open(prop_sub_infile_name,"r")
+			first_line = True
+			for line in prop_sub_infile:
+				line = line.rstrip('\n').split("\t")
+				if first_line == True:
+					qual_list = line
+					first_line = False
+				else:
+					base_nt = line[0]
+					sub_nt = line[1]
+					if base_nt== focal_nt and sub_nt == focal_sub_nt:
+						for a in range(2,len(line)):
+							qual_val = int(qual_list[a])
+							prop_val = float(round_to_n_sig_figs(float(line[a]),4))
+							focal_nt_count = focal_nt_obs_dict[base_nt+str(qual_val)]
+							sub_nt_count = nt_count_dict[base_nt+sub_nt+str(qual_val)]
+							if prop_val > 0. and qual_val >= min_qual_val_to_fit and focal_nt_count >= 1e4 and sub_nt_count>=10:
+								fit_sub_dict[focal_nt+focal_sub_nt+'-'+str(qual_val)] = prop_val
+								qual_val_list[qual_val] = ''
+			prop_sub_infile.close()
+	qual_val_list = list(qual_val_list.keys())
+	qual_val_list = sorted(qual_val_list)
+
+	for qual_val in range(min_qual_val_to_fit,max(41,max(qual_val_list)+1)):
+		for p in range(0,len(bases)):
+			focal_nt = bases[p]
+			for h in range(0,len(bases)):
+				focal_sub_nt = bases[h]
+				try:
+					prop = fit_sub_dict[focal_nt+focal_sub_nt+'-'+str(qual_val)]
+				except:
+					fit_sub_dict[focal_nt+focal_sub_nt+'-'+str(qual_val)] = 0.0
+			# prop_total = 0.
+				# prop_total += prop
+			# if prop_total > 0.:
+			# 	remainder = 1.0 - prop_total
+			# 	fit_sub_dict[focal_nt+focal_nt+'-'+str(qual_val)] = remainder
+		# qual_val = qual_val_list[q]
+	outlines = '\t'
+	for qual_val in range(min_qual_val_to_fit,max(41,max(qual_val_list)+1)):
+		outlines += '\t'+str(qual_val)
+	outlines += '\n'
+	for p in range(0,len(bases)):
+		focal_nt = bases[p]
+		prop_total = 0.
+		for h in range(0,len(bases)):
+			focal_sub_nt = bases[h]
+			outlines += focal_nt+'\t'+focal_sub_nt
+			for qual_val in range(min_qual_val_to_fit,max(41,max(qual_val_list)+1)):
+			# for q in range(0,len(qual_val_list)):
+			# 	qual_val = qual_val_list[q]
+				try:
+					prop = fit_sub_dict[focal_nt+focal_sub_nt+'-'+str(qual_val)]
+				except:
+					prop = 0.0
+				outlines += '\t'+str(prop)
+			outlines += '\n'
+	fit_sub_outfile = open(fit_prop_sub_outfile_name,'w')
+	fit_sub_outfile.write(outlines)
+	fit_sub_outfile.close()
+	return fit_sub_dict
+
+
+def load_fit_qual(prop_infile_name):
+	sub_dict = {}
+	sub_infile = open(prop_infile_name,"r")
+	first_line = True
+	for line in sub_infile:
+		line = line.rstrip('\n').split("\t")
+		if first_line == True:
+			qual_list = line
+			first_line = False
+		else:
+			base_nt = line[0]
+			sub_nt = line[1]
+			for a in range(2,len(line)):
+				qual_val = int(qual_list[a])
+				prop_val = float(line[a])
+				sub_dict[base_nt+sub_nt+'-'+str(qual_val)] = prop_val
+	sub_infile.close()
+	return sub_dict
+
 
 def barcode_from_fullseq(barcode_dict,seq_in):
 	barcode = ''
@@ -584,13 +1050,35 @@ def barcode_from_fullseq(barcode_dict,seq_in):
 		barcode += seq_in[barcode_site]
 	return barcode
 
+def find_all_possible_barcode_combinations(barcode_sites):
+	full_barcode_list = []
+	barcode_site_list = sorted(list(set(list(barcode_sites.keys()))))
+	for b in range(0,len(barcode_site_list)):
+		site = barcode_site_list[b]
+		full_barcode_list = list(set(full_barcode_list))
+		nt_list = barcode_sites[site]
+		building_barcodes = []
+		if full_barcode_list == []:
+			for num in range(0,len(nt_list)): 
+				building_barcodes.append(nt_list[num])
+		else:
+			for bar_num in range(0,len(full_barcode_list)):
+				for nt_num in range(0,len(nt_list)):
+					growing_nt_string = full_barcode_list[bar_num]+nt_list[nt_num]
+					building_barcodes.append(growing_nt_string)
+		full_barcode_list = building_barcodes
+	full_barcode_list = sorted(list(set(full_barcode_list)))
+	return full_barcode_list
 
-def screen_barcode_site_qual(seq_in,qual_in,seq_expect,barcode_dict,min_barcode_site_qual,min_other_site_qual,F_edge_ignore,R_edge_ignore):
+
+def screen_barcode_site_qual(seq_in,qual_in,seq_expect,barcode_dict,F_edge_ignore,R_edge_ignore):
 	barcode_mismatches = 0
 	backbone_mismatches = 0
-	high_qual_mismatches = 0
+	# high_qual_mismatches = 0
 	mismatch_sites = []
 	expected_barcode_nt_list = []
+	barcode_string = ''
+	qual_list = []
 	for site in range(0+F_edge_ignore,len(seq_expect)-R_edge_ignore):
 		try:
 			expected_barcode_nt_list = barcode_dict[site]
@@ -601,29 +1089,301 @@ def screen_barcode_site_qual(seq_in,qual_in,seq_expect,barcode_dict,min_barcode_
 		site_nt = seq_in[site]
 		site_qual = ord(qual_in[site])-33
 		if barcode_site == False:
-			if site_qual < min_other_site_qual:
+			if site_nt != seq_expect[site]:
 				backbone_mismatches += 1
 				mismatch_sites.append(site)
-			elif site_nt != seq_expect[site]:
-				backbone_mismatches += 1
-				mismatch_sites.append(site)
-				if site_qual >= min_qual_backbone:
-					high_qual_mismatches += 1
 		elif barcode_site == True:
-			if site_nt == expected_barcode_nt_list[0] or site_nt == expected_barcode_nt_list[1]:
-				if site_qual < min_barcode_site_qual:
-					barcode_mismatches += 1
-					mismatch_sites.append(site)
-			else:
+			barcode_string += site_nt
+			qual_list.append(site_qual)
+			if site_nt != expected_barcode_nt_list[0] and site_nt != expected_barcode_nt_list[1]:
 				barcode_mismatches += 1
 				mismatch_sites.append(site)
-				if site_qual >= min_barcode_site_qual:
-					high_qual_mismatches += 1
-
-	total_mismatches = barcode_mismatches+backbone_mismatches
+	qual_list = tuple(qual_list)
+	out_tup = (barcode_string,qual_list)
+	# total_mismatches = barcode_mismatches+backbone_mismatches
 	mismatch_sites = list(set(mismatch_sites))
-	return total_mismatches,mismatch_sites,high_qual_mismatches
+	return out_tup,barcode_mismatches,backbone_mismatches,mismatch_sites#,high_qual_mismatches
 
+# def read_in_barcode_qual_data(filepath,minQ_val=15):
+# 	output_list = []
+# 	infile = open(filepath)
+# 	for line in infile:
+# 		line = line.strip().split('\t')
+# 		B = line[0]
+# 		Qlist = line[1].split(',')
+# 		Q = []
+# 		for q in range(0,len(Qlist)):
+# 			Q.append(int(Qlist[q]))
+# 		Q = tuple(Q)
+# 		min_Q = min(Q)
+# 		max_Q = max(Q)
+# 		Qsum = np.sum(Q)
+# 		C = int(line[2])
+# 		if min_Q >= minQ_val:
+# 			out_tup = (C,min_Q,Qsum,B,Q)
+# 			output_list.append(out_tup)
+# 	return output_list
+
+def cal_hamming_dist(seq1,seq2):
+	mismatch_count = 0
+	if len(seq1)!=len(seq2):
+		sys.exit("Cannot calculate hamming distance between strings with different lengths: "+seq1+' '+seq2)
+	for i in range(0,len(seq1)):
+		if seq1[i] != seq2[i]:
+			mismatch_count+=1
+	return mismatch_count
+
+def abundance_pval(intup_i, intup_j): #i is the focal barcode, j is the higher abundance barcode
+	barcode_i, qual_tup_i, count_i = intup_i[3],intup_i[4],intup_i[0]
+	barcode_j, count_j = intup_j[0],intup_j[1]
+	p_list = []
+	for l in range(0,len(barcode_i)):
+		nt_i = barcode_i[l]
+		nt_j = barcode_j[l]
+		q_i = qual_tup_i[l]
+		p = sub_prob_dict[nt_j+nt_i+'-'+str(q_i)]
+		p_list.append(p)
+	y_ij = np.prod(p_list)
+	val1 = scipy.stats.poisson.pmf(k=0,mu=y_ij*count_j)
+	val2 = scipy.stats.poisson.cdf(k=count_i,mu=y_ij*count_j)
+	if val1 == 1.0:
+		pA = 0.0
+	else:
+		pA = (1.0/(1.0-val1)) * (1.0-val2)
+	if str(pA) == 'nan':
+		pA = 1.0
+	else:
+		pA = float(round_to_n_sig_figs(pA,4))
+	return pA
+
+def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,max_hamming_dist=3):
+	new_seed_counter = 0
+	ranked_barcode_list = sorted(input_barcode_list,reverse=True)
+	partition_dict = {}
+	partition_count_dict = {}
+	consolodated_dict = {}
+	invalid_barcode_list = {}
+	debug_lines = ''
+	first_seed_barcode = ''
+	active_ranked_barcode_list = []
+
+	#initiate first seed barcode
+	for i in range(0,len(ranked_barcode_list)):
+		query_tup = ranked_barcode_list[i]
+		query_C = query_tup[0]
+		query_Qsum = query_tup[2]
+		query_B = query_tup[3]
+		query_Q = query_tup[4]
+		valid_barcodeID = False
+		try:
+			full_barcode_dict[query_B]
+			valid_barcodeID = True
+		except:
+			pass
+		if valid_barcodeID == True:
+			if partition_dict == {} and query_C > 1:
+				partition_dict[query_B] = [query_tup]
+				partition_count_dict[query_B] = query_C
+				consolodated_dict[query_tup] = 'first-seed'
+				first_seed_barcode = query_B
+				new_seed_counter += 1
+			else:
+				if query_B == first_seed_barcode:
+					partition_dict[query_B].append(query_tup)
+					partition_count_dict[query_B] += query_C
+					consolodated_dict[query_tup] = 'first-seed-collapse'
+				elif query_C >= 1:
+					active_ranked_barcode_list.append(query_tup)
+	active_ranked_barcode_list = sorted(active_ranked_barcode_list,reverse=True)
+
+	#Find subsequent valid barcodes and initiate seeds
+	if len(active_ranked_barcode_list)==0:
+		return partition_count_dict
+	still_iterating = True
+	iteration_count = 0
+	while still_iterating == True:
+		iteration_count +=1
+		seed_barcode_list = list(partition_dict.keys())
+		pA_rank_list = []
+		new_seed_B = ''
+		if len(active_ranked_barcode_list) >0:
+			minimum_pA_threshold = pval_thresh/(float(len(active_ranked_barcode_list)))
+			for i in range(0,len(active_ranked_barcode_list)):
+				query_tup = active_ranked_barcode_list[i]
+				query_C = query_tup[0]
+				query_Qsum = query_tup[2]
+				query_B = query_tup[3]
+				query_Q = query_tup[4]
+				valid_barcodeID = False
+				try:
+					full_barcode_dict[query_B]
+					valid_barcodeID = True
+				except:
+					pass
+				consolodated_barcodeID = False
+				try:
+					consolodated_dict[query_tup]
+					consolodated_barcodeID= True
+				except:
+					pass
+				if valid_barcodeID == True and query_C > 1 and consolodated_barcodeID == False:
+					query_pA_list = []
+					for b in range(0,len(seed_barcode_list)):
+						seed_B = seed_barcode_list[b]
+						seed_C = partition_count_dict[seed_B]
+						seed_tup = (seed_B,seed_C)
+						if seed_B != query_B:
+							hdist = cal_hamming_dist(query_B,seed_B)
+							if seed_C > query_C and hdist <= max_hamming_dist:
+								pA = abundance_pval(query_tup, seed_tup)
+							else:
+								pA = 0.0
+							dist_val = 1.0/hdist
+							count_val = 1.0/query_C
+							temp_tup = (pA,count_val,dist_val,seed_B)
+							query_pA_list.append(temp_tup)
+					query_pA_list = sorted(query_pA_list,reverse=True)
+					min_tup = query_pA_list[0]
+					min_pA = min_tup[0]
+					min_seed_B = min_tup[3]
+					min_hdist = cal_hamming_dist(query_B,min_seed_B)
+					min_seed_C = partition_count_dict[min_seed_B]
+					temp_tup = (min_pA,1.0/query_C,1.0/min_hdist,1.0/min_seed_C,min_seed_B,query_tup)
+					pA_rank_list.append(temp_tup)
+		if len(pA_rank_list) > 0:
+			minimum_pA_threshold = pval_thresh/float(len(pA_rank_list))
+			pA_rank_list = sorted(pA_rank_list,reverse=False)
+			max_query_tup = pA_rank_list[0][-1]
+			max_query_pA = pA_rank_list[0][0]
+			max_query_B = max_query_tup[3]
+			max_query_C = max_query_tup[0]
+			max_query_Q = max_query_tup[4]
+			valid_query_barcodeID = False
+			try:
+				full_barcode_dict[max_query_B]
+				valid_query_barcodeID = True
+			except:
+				pass
+			new_active_ranked_barcode_list = []
+			if max_query_C > 1 and max_query_pA<=minimum_pA_threshold and valid_query_barcodeID == True:
+				partition_dict[max_query_B] = [max_query_tup]
+				partition_count_dict[max_query_B] = max_query_C
+				consolodated_dict[max_query_tup] = 'new-seed'
+				new_seed_B = max_query_B
+				new_seed_counter += 1
+				for b in range(0,len(active_ranked_barcode_list)):
+					query_tup = active_ranked_barcode_list[b]
+					query_C = query_tup[0]
+					# query_Qsum = query_tup[2]
+					query_B = query_tup[3]
+					query_Q = query_tup[4]
+					
+					consolodated_query_barcodeID = False
+					try:
+						consolodated_dict[query_tup]
+						consolodated_query_barcodeIDb = True
+					except:
+						pass
+					if query_B == new_seed_B and query_tup != max_query_tup and consolodated_query_barcodeID == False:
+						partition_dict[query_B].append(query_tup)
+						partition_count_dict[query_B] += query_C
+						consolodated_dict[query_tup] = 'new-seed-collapse'
+					elif query_B != new_seed_B:
+						new_active_ranked_barcode_list.append(query_tup)
+			else:
+				new_active_ranked_barcode_list = active_ranked_barcode_list
+			new_active_ranked_barcode_list = list(set(new_active_ranked_barcode_list))
+			if len(new_active_ranked_barcode_list) == len(active_ranked_barcode_list):
+				still_iterating = False
+			active_ranked_barcode_list = new_active_ranked_barcode_list
+			active_ranked_barcode_list = sorted(active_ranked_barcode_list,reverse=True)
+		else:
+			active_ranked_barcode_list = []
+			still_iterating = False
+	for i in range(0,len(ranked_barcode_list)):
+		query_tup = ranked_barcode_list[i]
+		query_B = query_tup[3]
+		if len(query_B) == len(query_B.replace('N','')):	
+			try:
+				consolodated_dict[query_tup]
+			except:
+				active_ranked_barcode_list.append(query_tup)
+	active_ranked_barcode_list = list(set(active_ranked_barcode_list))
+	active_ranked_barcode_list = sorted(active_ranked_barcode_list,reverse=True)
+
+	#agglomerate remaining valid barcodes
+	seed_barcode_list = list(partition_dict.keys())
+	minimum_pA_threshold = pval_thresh/(float(len(active_ranked_barcode_list)))#*len(seed_barcode_list))
+	for i in range(0,len(active_ranked_barcode_list)):
+		query_tup = active_ranked_barcode_list[i]
+		query_C = query_tup[0]
+		query_Qsum = query_tup[2]
+		query_B = query_tup[3]
+		query_Q = query_tup[4]
+		try:
+			full_barcode_dict[query_B]
+		except:
+			pass
+		consolodated_barcodeID = False
+		try:
+			consolodated_dict[query_tup]
+			consolodated_barcodeID = True
+		except:
+			pass
+		valid_barcodeID = False
+		try:
+			full_barcode_dict[query_B]
+			valid_barcodeID = True
+		except:
+			pass
+		if consolodated_barcodeID == False:
+			query_pA_list = []
+			for b in range(0,len(seed_barcode_list)):
+				seed_B = seed_barcode_list[b]
+				seed_C = partition_count_dict[seed_B]
+				seed_tup = (seed_B,seed_C)#partition_dict[seed_B][0]
+				hdist = cal_hamming_dist(query_B,seed_B)
+				if seed_B != query_B:
+					if query_C < seed_C and hdist <= max_hamming_dist:
+						pA = abundance_pval(query_tup, seed_tup)
+					else:
+						pA = 0.0
+					temp_tup = (pA,1.0/hdist,0,seed_B)
+					query_pA_list.append(temp_tup)
+			if len(query_pA_list) >= 1:
+				query_pA_list = sorted(query_pA_list,reverse=True)
+				min_tup = query_pA_list[0]
+				min_pA = min_tup[0]
+				min_seed_B = min_tup[3]
+				min_hdist = cal_hamming_dist(query_B,min_seed_B)
+				min_seed_C = partition_count_dict[min_seed_B]
+				minimum_pA_threshold = pval_thresh/(float(len(seed_barcode_list)))
+				if min_pA>=minimum_pA_threshold and query_C > 1 and min_hdist <= max_hamming_dist:
+					partition_dict[min_seed_B].append(query_tup)
+					count_before = partition_count_dict[min_seed_B]
+					partition_count_dict[min_seed_B] += query_C
+					consolodated_dict[query_tup] = 'seed-collapse'
+				elif valid_barcodeID == True:
+					try:
+						partition_dict[query_B].append(query_tup)
+						count_before = partition_count_dict[query_B]
+						partition_count_dict[query_B] += query_C
+						consolodated_dict[query_tup] = 'remain-add'
+					except:
+						partition_dict[query_B] = [query_tup]
+						partition_count_dict[query_B] = query_C
+						consolodated_dict[query_tup] = 'remain'
+			elif valid_barcodeID == True:
+				try:
+					partition_dict[query_B].append(query_tup)
+					count_before = partition_count_dict[query_B]
+					partition_count_dict[query_B] += query_C
+					consolodated_dict[query_tup] = 'last-add'
+				except:
+					partition_dict[query_B] = [query_tup]
+					partition_count_dict[query_B] = query_C
+					consolodated_dict[query_tup] = 'last'
+	return partition_count_dict
 
 def raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge):
 	global verbose
@@ -636,7 +1396,7 @@ def raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_d
 	else:
 		read_len_expected = amplicon_length
 	command = command_prefix+'bbduk.sh in="'+raw_reads_forward+'" out="'+trim_fastq_filename+'" qin=33 maq=20 minlength='+str(read_len_expected)+' maxlength='+str(read_len_expected)+' overwrite=t'
-	out = run_command(command+ ' overwrite=t -Xmx1000m')
+	out = run_command(command+ ' overwrite=t threads=2 -Xmx1000m')
 	if out == False:
 		sys.exit()
 	time.sleep(1)
@@ -686,37 +1446,37 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 	else:
 		read_len_expected = amplicon_length
 		diff_median_len = 0
-	command = command_prefix+'repair.sh in="'+raw_reads_forward+'" in2="'+raw_reads_reverse+'" out="'+repair_fastq_filename+'" fint=t repair=t overwrite=t -da -Xmx1000m'
+	command = command_prefix+'repair.sh in="'+raw_reads_forward+'" in2="'+raw_reads_reverse+'" out="'+repair_fastq_filename+'" fint=t repair=t threads=1 overwrite=t -da -Xmx1000m'
 	out = run_command(command)
 	if out == False:
-		sys.exit()
+		sys.exit("repair.sh failed: "+accession)
 	time.sleep(1)
 
 	len_diff_buffer = 50
 	command = command_prefix+'bbmerge.sh in="'+repair_fastq_filename+'" outadapter="'+temp_adapter_filename+'" minlength='+str(read_len_expected-(len_diff_buffer+diff_median_len))+' maxlength='+str(read_len_expected+(len_diff_buffer+diff_median_len))+' overwrite=t' #forcetrimleft=9
 	if force_trim_pre_merge >0:
 		command += " forcetrimleft="+str(force_trim_pre_merge)#+" forcetrimright=130"
-	out = run_command(command+" -Xmx2000m")
-
+	out = run_command(command+" threads=1 -Xmx2000m")
 	if out == False:
-		sys.exit()
+		sys.exit("bbmerge.sh adapter screen failed: "+accession)
 	time.sleep(1)
+
 	adapter_pass = check_adapter(temp_adapter_filename)
 	if adapter_pass == True:
 		command = command_prefix+'bbmerge.sh in="'+repair_fastq_filename+'" out="'+pretrim_fastq_filename+'" qin=33 mix=f adapters="'+temp_adapter_filename+'" minlength='+str(read_len_expected-(len_diff_buffer+diff_median_len))+' maxlength='+str(read_len_expected+(len_diff_buffer+diff_median_len)) #forcetrimleft=9 
 		if force_trim_pre_merge >0:
 			command += " forcetrimleft="+str(force_trim_pre_merge)#+" forcetrimright=130"
-		out = run_command(command+" overwrite=t -Xmx2000m")
+		out = run_command(command+" overwrite=t threads=1 -Xmx2000m")
 		if out == False:
-			sys.exit()
+			sys.exit("bbmerge.sh merge with adapter trim failed: "+accession)
 		time.sleep(1)
 	else:
 		command = command_prefix+'bbmerge.sh in="'+repair_fastq_filename+'" out="'+pretrim_fastq_filename+'" qin=33 mix=f minlength='+str(read_len_expected-(len_diff_buffer+diff_median_len))+' maxlength='+str(read_len_expected+(len_diff_buffer+diff_median_len))+' overwrite=t' #forcetrimleft=9 
 		if force_trim_pre_merge >0:
 			command += " forcetrimleft="+str(force_trim_pre_merge)#+" forcetrimright=130"
-		out = run_command(command+" overwrite=t -Xmx2000m")
+		out = run_command(command+" overwrite=t threads=1 -Xmx2000m")
 		if out == False:
-			sys.exit()
+			sys.exit("bbmerge.sh merge failed")
 		time.sleep(1)
 
 	if amplicon_length == 0:
@@ -724,9 +1484,9 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 	else:
 		median_merged_len = amplicon_length
 	command = command_prefix+'bbduk.sh in="'+pretrim_fastq_filename+'" out="'+merged_trimmed_filename+'" qin=33 maq=20 minlength='+str(median_merged_len)+' maxlength='+str(median_merged_len)+' tpe=f tbo=f'
-	out = run_command(command+ ' overwrite=t -Xmx1000m')
+	out = run_command(command+ ' overwrite=t threads=1 -Xmx1000m')
 	if out == False:
-		sys.exit()
+		sys.exit("bbduk.sh failed: "+accession)
 	time.sleep(1)
 
 	if truncate_length_post_merge > 0:
@@ -739,20 +1499,46 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 	
 	return clean_filename_out
 
+def subsample_read_counts(barcode_qual_count_dict_in,subsample_count):
+	rand_list = []
+	for barcode_qual_tup in barcode_qual_count_dict_in:
+		barcode_string = barcode_qual_tup[0]
+		barcode_qual_list = barcode_qual_tup[1]
+		count = barcode_qual_count_dict_in[barcode_qual_tup]
+		for i in range(0,count):
+			rand_list.append(barcode_qual_tup)
+	random.shuffle(rand_list)
+	subset_list = rand_list[0:int(subsample_count)]
+	barcode_qual_count_dict_out = {}
+	for i in range(0,len(subset_list)):
+		barcode_qual_tup = subset_list[i]
+		try:
+			barcode_qual_count_dict_out[barcode_qual_tup] += 1
+		except:
+			barcode_qual_count_dict_out[barcode_qual_tup] = 1
+	return barcode_qual_count_dict_out
 
-def barcode_screen_trimmed_reads(accession,sequence_filename,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,temp_dir,output_dir,F_edge_ignore,R_edge_ignore):
+def barcode_screen_trimmed_reads(accession,sequence_filename,expected_amplicon_seq,barcode_sites,min_Q_score,temp_dir,output_dir,F_edge_ignore,R_edge_ignore):
+	reads_per_sample_ceiling = 1e5
 	### Load in processed reads and collect sequence to quality info to screen for barcodes
 	global verbose
 	if verbose == True:
 		update_print_line("Screening reads for barcodes",accession)
-	infile = open(sequence_filename,"r")
+	barcode_qual_count_filename = trim_dir+accession+'.barcode_qual_counts.txt'
+	# if os.path.isfile() == True and overwrite_existing_files == False:
+	# 	barcode_qual_list = read_in_barcode_qual_data(barcode_qual_count_filename)
+	# else:
+	# mismatched_barcode_count_dict = {}
+	# high_qual_nonbarcode_count_dict = {}
+	fastq_infile = open(sequence_filename,"r")
 	mismatch_by_site = {}
-	barcode_count_dict = {}
-	high_qual_nonbarcode_count_dict = {}
+	barcode_qual_count_dict = {}
+	uncorrected_barcode_count_dict = {}
 	barcode_list = []
 	line_counter = -1
 	seq_count = 0
-	for line in infile:
+	pass_seq_count = 0
+	for line in fastq_infile:
 		line = line.strip()
 		line_counter += 1
 		if line_counter == 0:
@@ -765,33 +1551,86 @@ def barcode_screen_trimmed_reads(accession,sequence_filename,expected_amplicon_s
 			if len(nucleotide_line) == len(expected_amplicon_seq):
 				seq_count += 1
 				if verbose == True:
-					if seq_count%100000==0 and seq_count > 1:
+					if seq_count%1e5==0 and seq_count > 1:
 						update_print_line("Reads screened: "+str(seq_count),accession)
 						# print('\tReads screened from: "'+accession+'":\t'+str(seq_count))
-				mismatch_count,read_mismatch_locs,high_qual_mismatches = screen_barcode_site_qual(nucleotide_line,qual_line,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,F_edge_ignore,R_edge_ignore)#(seq_in,qual_in,seq_expect,barcode_dict,min_barcode_site_qual,min_other_site_qual)
-				if mismatch_count == 0:
-					barcode_string = barcode_from_fullseq(barcode_sites,nucleotide_line)
-					try:
-						barcode_count_dict[barcode_string] += 1
-					except:
-						barcode_count_dict[barcode_string] = 1
-						barcode_list.append(barcode_string)
-				elif mismatch_count <= 3:
-					for site_num in read_mismatch_locs:
+				# mismatch_count,read_mismatch_locs,high_qual_mismatches = screen_barcode_site_qual(nucleotide_line,qual_line,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,F_edge_ignore,R_edge_ignore)#(seq_in,qual_in,seq_expect,barcode_dict,min_barcode_site_qual,min_other_site_qual)
+				read_barcode_tup,barcode_mismatches,backbone_mismatches,mismatch_list = screen_barcode_site_qual(nucleotide_line,qual_line,expected_amplicon_seq,barcode_sites,F_edge_ignore,R_edge_ignore)#(seq_in,qual_in,seq_expect,barcode_dict,min_barcode_site_qual,min_other_site_qual)
+				if min(read_barcode_tup[1]) >= min_Q_score:
+					total_mismatches = barcode_mismatches+backbone_mismatches
+					if backbone_mismatches == 0 and barcode_mismatches <= 1:
 						try:
-							mismatch_by_site[site_num] += 1
+							barcode_qual_count_dict[read_barcode_tup] += 1
 						except:
-							mismatch_by_site[site_num] = 1
-					if high_qual_mismatches == mismatch_count:
-						try:
-							high_qual_nonbarcode_count_dict[nucleotide_line] += 1
-						except:
-							high_qual_nonbarcode_count_dict[nucleotide_line] = 1
+							barcode_qual_count_dict[read_barcode_tup] = 1
+						pass_seq_count += 1
+						if barcode_mismatches == 0:
+							try:
+								uncorrected_barcode_count_dict[read_barcode_tup[0]] += 1
+							except:
+								uncorrected_barcode_count_dict[read_barcode_tup[0]] = 1
+					if len(mismatch_list)>0:
+						for m in range(0,len(mismatch_list)):
+							try:
+								mismatch_by_site[mismatch_list[m]] += 1
+							except:
+								mismatch_by_site[mismatch_list[m]] = 1
 			line_counter = -1
-	barcode_list = sorted(list(set(barcode_list)))
-	infile.close()
+	# barcode_list = sorted(list(set(barcode_list)))
+	fastq_infile.close()
 
-	#### summarize mismatch count
+	if pass_seq_count > reads_per_sample_ceiling:
+		barcode_qual_count_dict = subsample_read_counts(barcode_qual_count_dict,reads_per_sample_ceiling)
+		if verbose == True:
+			update_print_line("Subsampled read counts to "+str(int(reads_per_sample_ceiling)),accession)
+
+	barcode_qual_list = []
+	outstring = ''
+	for read_barcode_tup in barcode_qual_count_dict:
+		barcode_string = read_barcode_tup[0]
+		barcode_qual_tup = read_barcode_tup[1]
+		count = barcode_qual_count_dict[read_barcode_tup]
+		min_Q = min(barcode_qual_tup)
+		max_Q = max(barcode_qual_tup)
+		Qsum = np.sum(barcode_qual_tup)
+		if min_Q >= min_Q_score:
+			out_tup = (count,min_Q,Qsum,barcode_string,barcode_qual_tup)
+			barcode_qual_list.append(out_tup)
+		outstring += barcode_string+'\t'+str(barcode_qual_tup[0])
+		for i in range(1,len(barcode_qual_tup)):
+			outstring += ','+str(barcode_qual_tup[i])
+		outstring += '\t'+str(count)+'\n'
+	barcode_qual_count_file = open(barcode_qual_count_filename,'w')
+	barcode_qual_count_file.write(outstring)
+	barcode_qual_count_file.close()
+
+	full_barcode_list = find_all_possible_barcode_combinations(barcode_sites)
+	full_barcode_dict = {}
+	for f in range(0,len(full_barcode_list)):
+		barcode = full_barcode_list[f]
+		full_barcode_dict[barcode] = None
+
+	barcode_count_dict = divisive_partition(barcode_qual_list,full_barcode_dict)
+	#### count unique barcodes
+	raw_barcode_list = sorted(list(uncorrected_barcode_count_dict.keys()))
+	raw_barcode_outfile = open(temp_dir+accession+".raw_barcode_count.txt","w")
+	raw_barcode_outfile.write("barcode\tcount\n")
+	for num in range(0,len(raw_barcode_list)):
+		barcode_string = raw_barcode_list[num]
+		raw_barcode_count = uncorrected_barcode_count_dict[barcode_string]
+		raw_barcode_outfile.write(str(barcode_string)+"\t"+str(raw_barcode_count)+"\n")
+	raw_barcode_outfile.close()
+
+	barcode_list = sorted(list(barcode_count_dict.keys()))
+	barcode_outfile = open(temp_dir+accession+".barcode_count.txt","w")
+	barcode_outfile.write("barcode\tcount\n")
+	for num in range(0,len(barcode_list)):
+		barcode_string = barcode_list[num]
+		barcode_count = barcode_count_dict[barcode_string]
+		barcode_outfile.write(str(barcode_string)+"\t"+str(barcode_count)+"\n")
+	barcode_outfile.close()
+
+	### summarize mismatch count
 	mismatch_prop_by_site = {}
 	mismatch_by_site_outfile = open(temp_dir+accession+".mismatch_info.txt","w")
 	mismatch_by_site_outfile.write("Site_number\tmismatches\n")
@@ -806,28 +1645,26 @@ def barcode_screen_trimmed_reads(accession,sequence_filename,expected_amplicon_s
 			mismatch_by_site_outfile.write(str(col)+"\t"+str(mismatch_prop)+"\n")
 	mismatch_by_site_outfile.close()
 
-	#### count unique barcodes
-	barcode_outfile = open(temp_dir+accession+".barcode_count.txt","w")
-	barcode_outfile.write("barcode\tcount\n")
-	for num in range(0,len(barcode_list)):
-		barcode_string = barcode_list[num]
-		barcode_count = barcode_count_dict[barcode_string]
-		barcode_outfile.write(str(barcode_string)+"\t"+str(barcode_count)+"\n")
-	barcode_outfile.close()
+	### write file with full read count
+	read_count_outfile = open(temp_dir+accession+".total_read_count.txt","w")
+	read_count_outfile.write(str(pass_seq_count)+'\n')
+	read_count_outfile.close()
 
-	#### count high-quality non-barcode sites
-	nonbarcode_outfile = open(temp_dir+accession+".nonbarcode_count.txt","w")
-	nonbarcode_outfile.write("non-barcode_seq\tcount\n")
-	for nucl_string in high_qual_nonbarcode_count_dict:
-		nonbarcode_count = high_qual_nonbarcode_count_dict[nucl_string]
-		nonbarcode_outfile.write(str(nucl_string)+"\t"+str(nonbarcode_count)+"\n")
-	nonbarcode_outfile.close()
+	# #### count high-quality non-barcode sites
+	# nonbarcode_outfile = open(temp_dir+accession+".nonbarcode_count.txt","w")
+	# nonbarcode_outfile.write("non-barcode_seq\tcount\n")
+	# for nucl_string in high_qual_nonbarcode_count_dict:
+	# 	nonbarcode_count = high_qual_nonbarcode_count_dict[nucl_string]
+	# 	nonbarcode_outfile.write(str(nucl_string)+"\t"+str(nonbarcode_count)+"\n")
+	# nonbarcode_outfile.close()
+	# os.rename(temp_dir+accession+".nonbarcode_count.txt",output_dir+"samples/"+accession+".nonbarcode_count.txt")
 
 	os.rename(temp_dir+accession+".mismatch_info.txt",output_dir+"samples/"+accession+".mismatch_info.txt")
 	os.rename(temp_dir+accession+".barcode_count.txt",output_dir+"samples/"+accession+".barcode_count.txt")
-	os.rename(temp_dir+accession+".nonbarcode_count.txt",output_dir+"samples/"+accession+".nonbarcode_count.txt")
+	os.rename(temp_dir+accession+".raw_barcode_count.txt",output_dir+"samples/"+accession+".raw_barcode_count.txt")
+	os.rename(temp_dir+accession+".total_read_count.txt",output_dir+"samples/"+accession+".total_read_count.txt")
 
-	return barcode_count_dict,barcode_list,mismatch_prop_by_site,high_qual_nonbarcode_count_dict
+	return barcode_count_dict,barcode_list,mismatch_prop_by_site#,high_qual_nonbarcode_count_dict
 
 
 def clean_files_for_one_sample(accession,output_dir,trim_dir):
@@ -846,15 +1683,15 @@ def clean_files_for_one_sample(accession,output_dir,trim_dir):
 	if os.path.isfile(processed_read_filename) == True:
 		os.remove(processed_read_filename)
 
-
 def update_print_line(string_in,accession):
 	global longest_accession_length
 	print(accession+" "*(longest_accession_length-len(accession))+" - "+string_in)
 
 ##########################      Core pipeline function      ##########################
 
-def reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge):
-	update_print_line("Sample processing start",accession)
+def reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_Q_score,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge,trim_all_files_for_qual_learning=False):
+	# update_print_line("Sample processing start",accession)
+	processed_something = False
 	raw_reads_forward = input_read_dir+accession+forward_read_suffix
 	raw_reads_reverse = input_read_dir+accession+reverse_read_suffix
 
@@ -863,7 +1700,7 @@ def reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,re
 	barcode_mismatch_info_filename = output_dir+"samples/"+accession+".mismatch_info.txt"
 	sample_nonbarcode_info_filename = output_dir+"samples/"+accession+".nonbarcode_count.txt"
 	processed_read_filename = trim_dir+accession+".fq"
-	#clear the temporary files folder from previous interrupted runs
+	#clear the temporary files folder from any previously interrupted runs
 	temp_files_list = [f for f in os.listdir(temp_dir)]
 	for files in temp_files_list:
 		if accession+"." in files:
@@ -882,19 +1719,25 @@ def reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,re
 		if os.path.isfile(processed_read_filename) == False:
 			if raw_read_input_type == "paired":
 				processed_read_filename = raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_reads_reverse,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge)
+				processed_something = True
 			elif raw_read_input_type == "single":
 				processed_read_filename = raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge)
+				processed_something = True
 	elif reads_already_screened_for_quality == True:
 		processed_read_filename = raw_reads_forward
-
-	if os.path.isfile(sample_barcode_info_filename) == False:
-		barcode_count_dict,barcode_list,mismatch_by_site,high_qual_nonbarcode_dict = barcode_screen_trimmed_reads(accession,processed_read_filename,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,temp_dir,output_dir,F_edge_ignore,R_edge_ignore)
+	if trim_all_files_for_qual_learning == True:
+		qual_summary_tup = pull_qual_info(processed_read_filename)
+		return qual_summary_tup
 	else:
-		barcode_count_dict,barcode_list,mismatch_by_site,high_qual_nonbarcode_dict = read_in_barcodes(sample_barcode_info_filename,barcode_mismatch_info_filename,sample_nonbarcode_info_filename)
-	out_tup = (accession,barcode_count_dict,barcode_list,mismatch_by_site,high_qual_nonbarcode_dict)
-	
-	update_print_line("Completed",accession)
-	return out_tup
+		if os.path.isfile(sample_barcode_info_filename) == False:
+			barcode_count_dict,barcode_list,mismatch_by_site = barcode_screen_trimmed_reads(accession,processed_read_filename,expected_amplicon_seq,barcode_sites,min_Q_score,temp_dir,output_dir,F_edge_ignore,R_edge_ignore) #,high_qual_nonbarcode_dict
+			processed_something = True
+		else:
+			barcode_count_dict,barcode_list,mismatch_by_site = read_in_barcodes(sample_barcode_info_filename,barcode_mismatch_info_filename,sample_nonbarcode_info_filename) #,high_qual_nonbarcode_dict
+		out_tup = (accession,barcode_count_dict,barcode_list,mismatch_by_site)#,high_qual_nonbarcode_dict)
+		if processed_something == True:
+			update_print_line("Completed",accession)
+		return out_tup
 
 
 #####################################   MAIN   ######################################
@@ -999,11 +1842,19 @@ if continue_running == False:
 
 ### Create list of samples to process
 file_list = [f for f in os.listdir(input_read_dir) if f.endswith(forward_read_suffix)]
+# if len(file_list) == 0:
+# 	file_list = [f for f in os.listdir(input_read_dir) if f.endswith(forward_read_suffix+".gz")]
+# 	if len(file_list) == 0:
+# 		file_list = [f for f in os.listdir(input_read_dir) if f.endswith(forward_read_suffix+".tar.gz")]
+
 accession_list = []
 for files in file_list:
 	accession = files.split(forward_read_suffix)[0]
 	accession_list.append(accession)
 accession_list = list(set(accession_list))
+	# if accession != 'KH50_02':
+
+# accession_list = []
 
 sorted_accession_list = sorted(accession_list)
 print_line_dict = {}
@@ -1019,8 +1870,6 @@ detect_barcode_content_first = True
 amplicon_info_infile_path = project_dir+amplicon_info_infile_name
 if os.path.isfile(amplicon_info_infile_path):
 	expected_amplicon_seq,barcode_sites = load_barcode_info(project_dir+amplicon_info_infile_path)
-	# print(expected_amplicon_seq)
-	# print(barcode_sites)
 	if expected_amplicon_seq != "" and barcode_sites != {}:
 		detect_barcode_content_first = False
 else:
@@ -1053,16 +1902,18 @@ if detect_barcode_content_first == True:
 		processed_read_filename = raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_reads_reverse,trim_dir,temp_dir,detect_barcode_content_first,0,force_trim_pre_merge,truncate_length_post_merge)
 	elif raw_read_input_type == "single":
 		processed_read_filename = raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,detect_barcode_content_first,0,force_trim_pre_merge,truncate_length_post_merge)
-	temp_seq_dict,temp_read_length = subset_fastq(processed_read_filename,10000,50000)
+	temp_seq_dict,temp_read_length = subset_fastq(processed_read_filename,10000,500000)
 	expected_amplicon_seq,barcode_sites = detect_barcode_content(temp_seq_dict,temp_read_length)
 	continue_running = False
 	if len(barcode_sites) == num_expected_barcode_sites:
 		print('\n\nThe correct number of expected barcode sites were automatically detected.\n')
 		continue_running = False
 		print("amplicon sequence:\n\t"+expected_amplicon_seq)
-		for site in barcode_sites:
+		temp_barcode_site_list = list(barcode_sites.keys())
+		temp_barcode_site_list = sorted(temp_barcode_site_list)
+		for site_num in range(0,len(temp_barcode_site_list)):
+			site = temp_barcode_site_list[site_num]
 			print("\t"+str(site)+"\t"+barcode_sites[site][0]+" or "+barcode_sites[site][1])
-
 		print('\nAre these sites and possible nucleotides correct?')
 		decision = input("(yes or no)\n")
 		if decision == "Y" or decision == "y" or decision == "Yes" or decision == "yes" or decision == "YES":
@@ -1076,12 +1927,18 @@ if detect_barcode_content_first == True:
 		clean_files_for_one_sample(accession,output_dir,trim_dir)
 		print('\n\nThe incorrect number of expected barcode sites were predicted.\nExpected '+str(num_expected_barcode_sites)+", found: "+str(len(barcode_sites)))
 		print("\namplicon sequence:\n\t"+expected_amplicon_seq)
-		for site in barcode_sites:
+		temp_barcode_site_list = list(barcode_sites.keys())
+		temp_barcode_site_list = sorted(temp_barcode_site_list)
+		for site_num in range(0,len(temp_barcode_site_list)):
+			site = temp_barcode_site_list[site_num]
 			print("\t"+str(site)+"\t"+barcode_sites[site][0]+" or "+barcode_sites[site][1])
 		print('\nThe predicted barcode sites will be written to the file: "amplicon_info.auto.txt"\nEither try re-running the script to re-predict barcode content using a different random sample, or edit this file manually, then rename it to "amplicon_info.txt" before re-running this script to proceed.')
 		outfile = open(project_dir+"amplicon_info.auto.txt","w")
 	outfile.write("amplicon_seq\t"+expected_amplicon_seq+"\n")
-	for site in barcode_sites:
+	temp_barcode_site_list = list(barcode_sites.keys())
+	temp_barcode_site_list = sorted(temp_barcode_site_list)
+	for site_num in range(0,len(temp_barcode_site_list)):
+		site = temp_barcode_site_list[site_num]
 		outfile.write(str(site)+"\t"+barcode_sites[site][0]+","+barcode_sites[site][1]+"\n")
 	outfile.close()
 
@@ -1089,63 +1946,181 @@ if detect_barcode_content_first == True:
 		clean_files_for_one_sample(accession,output_dir,trim_dir)
 		sys.exit("\n\nExiting.")
 
-### Process all samples
+### Trim read for all samples to summarize substitution frequency given quality
+lane_prop_sub_qual_filename = output_dir+"sub_qual_info.prop.txt"
+lane_count_sub_qual_filename = output_dir+"sub_qual_info.count.txt"
+lane_prop_fit_qual_filename = output_dir+"sub_qual_fit.prop.txt"
+if os.path.isfile(lane_prop_sub_qual_filename) == False:
+	if parallel_max_cpu == 0:
+		pre_trim_numcore = int(multiprocessing.cpu_count()/5)
+	elif parallel_max_cpu > 0:
+		pre_trim_numcore = min(parallel_max_cpu,int(multiprocessing.cpu_count()/5))
+	elif parallel_max_cpu < 0:
+		pre_trim_numcore = int(multiprocessing.cpu_count()/5)-parallel_max_cpu
+	processed_list = []
+	processed_list = Parallel(n_jobs=pre_trim_numcore)(delayed(reads_to_barcodes_one_sample)(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_Q_score,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge,True) for accession in accession_list)
+	full_qual_sub_dict = {}
+	qual_vals = {}
+	for output_tup in processed_list:
+		sampleID = output_tup[0]
+		local_qual_sub_dict = output_tup[1]
+		# sub_count_dict = output_tup[2]
+		for backbone_nt in local_qual_sub_dict:
+			for sub_nt in local_qual_sub_dict[backbone_nt]:
+				for qual in local_qual_sub_dict[backbone_nt][sub_nt]:
+					try:
+						qual_vals[qual]
+					except:
+						qual_vals[qual] = ''
+					try:
+						full_qual_sub_dict[backbone_nt][sub_nt][qual] +=  local_qual_sub_dict[backbone_nt][sub_nt][qual]
+					except:
+						try:
+							full_qual_sub_dict[backbone_nt][sub_nt][qual] =  local_qual_sub_dict[backbone_nt][sub_nt][qual]
+						except:
+							try:
+								full_qual_sub_dict[backbone_nt][sub_nt] = {}
+								full_qual_sub_dict[backbone_nt][sub_nt][qual] = local_qual_sub_dict[backbone_nt][sub_nt][qual]
+							except:
+								full_qual_sub_dict[backbone_nt] = {}
+								full_qual_sub_dict[backbone_nt][sub_nt] = {}
+								full_qual_sub_dict[backbone_nt][sub_nt][qual] = local_qual_sub_dict[backbone_nt][sub_nt][qual]
+	qual_bins = sorted(list(qual_vals.keys()))
+	count_output_string = '\t'
+	prop_output_string = '\t'
+	for q in range(0,len(qual_bins)):
+		qual = qual_bins[q]
+		count_output_string += '\t'+str(qual)
+		prop_output_string += '\t'+str(qual)
+	count_output_string += '\n'
+	prop_output_string += '\n'
+	bases = ['A','T','C','G']
+	for b in range(0,len(bases)):
+		full_count_total_dict = {}
+		backbone_nt = bases[b]
+		for n in range(0,len(bases)):
+			sub_nt = bases[n]
+			count_output_string += backbone_nt+'\t'+sub_nt
+			for q in range(0,len(qual_bins)):
+				qual = qual_bins[q]
+				try:
+					f_count = full_qual_sub_dict[backbone_nt][sub_nt][qual]
+				except:
+					f_count = 0
+				count_output_string += '\t'+str(f_count)
+				try:
+					full_count_total_dict[qual] += f_count
+				except:
+					full_count_total_dict[qual] = f_count
+			count_output_string += '\n'
+		for n in range(0,len(bases)):
+			sub_nt = bases[n]
+			prop_output_string += backbone_nt+'\t'+sub_nt
+			for q in range(0,len(qual_bins)):
+				qual = qual_bins[q]
+				try:
+					f_count = full_qual_sub_dict[backbone_nt][sub_nt][qual]
+				except:
+					f_count = 0
+				f_total = float(full_count_total_dict[qual])
+				if f_total >0.0:
+					f_prop = float(f_count)/f_total
+				else:
+					f_prop = 0.0
+				prop_output_string += '\t'+str(f_prop)
+			prop_output_string += '\n'
+
+	outfile = open(lane_count_sub_qual_filename,"w")
+	outfile.write(count_output_string)
+	outfile.close()
+	outfile = open(lane_prop_sub_qual_filename,"w")
+	outfile.write(prop_output_string)
+	outfile.close()
+if os.path.isfile(lane_prop_fit_qual_filename) == False:
+	sub_prob_dict = fit_qual_model(lane_prop_sub_qual_filename,lane_count_sub_qual_filename,lane_prop_fit_qual_filename,min_Q_score)
+else:
+	sub_prob_dict = load_fit_qual(lane_prop_fit_qual_filename)
+
+
+### Fully process all samples
 processed_list = []
 if parallel_process == True:
-	processed_list = Parallel(n_jobs=num_cores)(delayed(reads_to_barcodes_one_sample)(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge) for accession in accession_list)
+	processed_list = Parallel(n_jobs=num_cores)(delayed(reads_to_barcodes_one_sample)(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_Q_score,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge) for accession in accession_list)
 elif parallel_process == False:
 	for accession in accession_list:
-		barcode_tup = reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_qual_barcode_sites,min_qual_backbone,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge)
+		barcode_tup = reads_to_barcodes_one_sample(accession,command_prefix,forward_read_suffix,reverse_read_suffix,input_read_dir,trim_dir,temp_dir,output_dir,expected_amplicon_seq,barcode_sites,min_Q_score,overwrite_existing_files,raw_read_input_type,reads_already_screened_for_quality,detect_barcode_content_first,F_edge_ignore,R_edge_ignore,force_trim_pre_merge,truncate_length_post_merge)
 		processed_list.append(barcode_tup)
 
 
 ##### create list of all possible barcodes
+bases = ['A','T','C','G']
+temp_full_barcode_list = find_all_possible_barcode_combinations(barcode_sites)
 full_barcode_list = []
-barcode_site_list = sorted(list(set(list(barcode_sites.keys()))))
-for b in range(0,len(barcode_site_list)):
-	site = barcode_site_list[b]
-	full_barcode_list = list(set(full_barcode_list))
-	nt_list = barcode_sites[site]
-	building_barcodes = []
-	if full_barcode_list == []:
-		for num in range(0,len(nt_list)): 
-			building_barcodes.append(nt_list[num])
-	else:
-		for bar_num in range(0,len(full_barcode_list)):
-			for nt_num in range(0,len(nt_list)):
-				growing_nt_string = full_barcode_list[bar_num]+nt_list[nt_num]
-				building_barcodes.append(growing_nt_string)
-	full_barcode_list = building_barcodes
-full_barcode_list = sorted(list(set(full_barcode_list)))
+
+barcodes_to_exclude = {}
+# barcodes_to_exclude = {'TCTATATGCG':'','TGGACTGCGG':''}
+
+for b in range(0,len(temp_full_barcode_list)):
+	barcodeID = temp_full_barcode_list[b]
+	skip = False
+	try:
+		barcodes_to_exclude[barcodeID]
+		skip = True
+	except:
+		skip = False
+	if skip == False:
+		full_barcode_list.append(barcodeID)
 
 ##### merge all barcode info once all samples finish running
 full_barcode_count_dict = {}
 full_mismatch_dict = {}
 full_nonbarcode_dict = {}
 full_read_count = {}
-full_nonbarcode_seq_list = []
+nosingleton_read_count = {}
+
+# full_nonbarcode_seq_list = []
 for accession_output in processed_list:
 	accession = accession_output[0]
 	full_barcode_count_dict[accession] = accession_output[1]
 	accession_barcode_list = accession_output[2]
 	full_mismatch_dict[accession] = accession_output[3]
-	full_nonbarcode_dict[accession] = accession_output[4]
 
 	accession_barcode_count = 0
-	accession_nonbarcode_count = 0
+	accession_barcode_count_nosingle = 0
 	for barcodeID in full_barcode_count_dict[accession]:
-		accession_barcode_count += full_barcode_count_dict[accession][barcodeID]
-	for string in full_nonbarcode_dict[accession]:
-		accession_nonbarcode_count += full_nonbarcode_dict[accession][string]
-		full_nonbarcode_seq_list.append(string)
-	full_read_count[accession] = (accession_barcode_count,accession_nonbarcode_count)
-	full_nonbarcode_seq_list = list(set(full_nonbarcode_seq_list))
+		skip = False
+		try:
+			barcodes_to_exclude[barcodeID]
+			skip = True
+		except:
+			skip = False
+		if skip == False:
+			local_count = full_barcode_count_dict[accession][barcodeID]
+			if local_count > 0:
+				accession_barcode_count += local_count
+				if local_count > 1:
+					accession_barcode_count_nosingle += local_count
+	full_read_count[accession] = accession_barcode_count
+	nosingleton_read_count[accession] = accession_barcode_count_nosingle
+accession_list_passcount = []
+for a in range(0,len(accession_list)):
+	accession = accession_list[a]
+	try:
+		local_count = full_read_count[accession]
+	except:
+		local_count = 0
+	if local_count>=min_barcodes_per_sample:
+		accession_list_passcount.append(accession)
+accession_list = accession_list_passcount
+del accession_list_passcount
 
 ### Write final summary output tables
 print("Writing barcode output summary tables")
 accession_list = sorted(accession_list)
-barcode_freq_dict = {}
 barcode_count_dict = {}
+barcode_freq_dict = {}
+barcode_count_dict_nosingleton = {}
+barcode_freq_dict_nosingleton = {}
 table_outfile = open(output_dir+"all_barcode_count.table.txt","w")
 freq_table_outfile = open(output_dir+"all_barcode_freq.table.txt","w")
 for a in range(0,len(accession_list)):
@@ -1160,13 +2135,16 @@ for b in range(0,len(full_barcode_list)):
 	freq_table_outfile.write(barcodeID)
 	for a in range(0,len(accession_list)):
 		accession = accession_list[a]
-		read_count = full_read_count[accession][0]
+		read_count = full_read_count[accession]
+		read_count_nosingleton = nosingleton_read_count[accession]
 		try:
 			barcode_count = full_barcode_count_dict[accession][barcodeID]
 			barcode_freq = (float(barcode_count)/float(read_count))
+			barcode_freq_nosingleton = (float(barcode_count)/float(read_count_nosingleton))
 		except:
 			barcode_count = 0
 			barcode_freq = 0
+			barcode_freq_nosingleton = 0
 		table_outfile.write("\t"+str(barcode_count))
 		freq_table_outfile.write("\t"+str(barcode_freq))
 		try:
@@ -1175,6 +2153,13 @@ for b in range(0,len(full_barcode_list)):
 		except:
 			barcode_freq_dict[accession] = [barcode_freq]
 			barcode_count_dict[accession] = [barcode_count]
+		if read_count > 1:
+			try:
+				barcode_freq_dict_nosingleton[accession].append(barcode_freq_nosingleton)
+				barcode_count_dict_nosingleton[accession].append(barcode_count)
+			except:
+				barcode_freq_dict_nosingleton[accession] = [barcode_freq_nosingleton]
+				barcode_count_dict_nosingleton[accession] = [barcode_count]
 	table_outfile.write("\n")
 	freq_table_outfile.write("\n")
 table_outfile.close()
@@ -1188,8 +2173,8 @@ for a in range(0,len(accession_list)):
 mismatch_table_outfile.write("\n")
 for site in range(0,len(expected_amplicon_seq)):
 	mismatch_table_outfile.write(str(site))
-	max_mismatch = 0
 	for a in range(0,len(accession_list)):
+		max_mismatch = 0
 		accession = accession_list[a]
 		try:
 			mismatch_prop = round(float(full_mismatch_dict[accession][site]),5)
@@ -1198,133 +2183,181 @@ for site in range(0,len(expected_amplicon_seq)):
 		mismatch_table_outfile.write("\t"+str(mismatch_prop))
 		if mismatch_prop > max_mismatch:
 			max_mismatch = mismatch_prop
-	max_mismatch_dict[accession] = max_mismatch
+		max_mismatch_dict[accession] = max_mismatch
 	mismatch_table_outfile.write("\n")
 mismatch_table_outfile.close()
 
 
-subID_dict = {}
-for seq in full_nonbarcode_seq_list:
-	if len(seq) == len(expected_amplicon_seq):
-		for site in range(0,len(expected_amplicon_seq)):
-			try:
-				expected_barcode_nt_list = barcode_sites[site]
-				barcode_site = True
-			except:
-				expected_barcode_nt_list = []
-				barcode_site = False
-			site_nt = seq[site]
-			if barcode_site == False and site_nt != expected_amplicon_seq[site]:
-				subID = str(site)+site_nt
-				subID_dict[subID] = ''
-			elif barcode_site == True:
-				if site_nt != expected_barcode_nt_list[0] and site_nt != expected_barcode_nt_list[1]:
-					subID = str(site)+site_nt
-					subID_dict[subID] = ''
-
-
-bases = ['A','T','C','G']
-table_outfile = open(output_dir+"all_nonbarcode_freq.table.txt","w")
-for a in range(0,len(accession_list)):
-	accession = accession_list[a]
-	table_outfile.write("\t"+accession)
-table_outfile.write("\n")
-for site in range(0,len(expected_amplicon_seq)):
-	for sub_nt in bases:
-		found = False
-		subID = str(site)+sub_nt
-		try:
-			subID_dict[subID]
-			found = True
-		except:
-			found = False
-		if found == True:
-			table_outfile.write(subID)
-			for a in range(0,len(accession_list)):
-				accession = accession_list[a]
-				sub_count = 0
-				for string in full_nonbarcode_dict[accession]:
-					if string[site] == sub_nt:
-						sub_count += full_nonbarcode_dict[accession][string]
-				read_count = full_read_count[accession][0]+full_read_count[accession][1]
-				if sub_count > 0:
-					sub_freq = (float(sub_count)/float(read_count))
-				else:
-					sub_freq = 0
-				table_outfile.write("\t"+str(sub_freq))
-			table_outfile.write("\n")
-table_outfile.close()
-
 print("Calculating alpha-diversity indicies")
-alpha_div_outfile = open(output_dir+"all_barcode.alpha_diversity.txt","w")
-alpha_div_outfile.write("sampleID\tshannon_div\tsimpson_div\tchao_richness\tshannon_evenness\n")
+all_process_inputs = []
 for i in range(0,len(accession_list)):
-	accession = accession_list[i]
-	H_shannon,E_shannon = shannon_alpha(barcode_freq_dict[accession])
-	H_simpson = simpson_alpha(barcode_freq_dict[accession])
-	R_chao = chao_1_richness(barcode_count_dict[accession])
-	alpha_div_outfile.write(accession+"\t"+str(H_shannon)+"\t"+str(H_simpson)+"\t"+str(R_chao)+"\t"+str(E_shannon)+"\n")
+	sample1 = accession_list[i]
+	count1 = barcode_count_dict[sample1]
+	process_tup = (sample1,count1)#,full_barcode_list)
+	all_process_inputs.append(process_tup)
+processed_list = Parallel(n_jobs=num_cores)(delayed(subsample_alpha_func)(process_tup,full_barcode_list,num_subsamples) for process_tup in all_process_inputs)
+
+sub_size_list = []
+alpha_subsample_infodict = {}
+alpha_fit_dict = {}
+for tup in processed_list:
+	s1 = tup[0]
+	alpha_subsample_infodict[s1] = tup[1]
+	alpha_fit_dict[s1] = tup[2]
+	local_sub_size_list = list(tup[1].keys())
+	if len(local_sub_size_list) > len(sub_size_list):
+		sub_size_list = sorted(local_sub_size_list)
+
+dist_function_name_list = ['shannon','simpson','even','rich','chao']
+for d in range(0,len(dist_function_name_list)):
+	dist_function_name = dist_function_name_list[d]
+	string_out = ''
+	for i in range(0,len(sub_size_list)):
+		subsample_size = sub_size_list[i]
+		string_out += '\t'+str(subsample_size)
+	string_out += '\n'
+	for p in range(0,len(accession_list)):
+		sampleID = accession_list[p]
+		string_out += sampleID
+		for i in range(0,len(sub_size_list)):
+			subsample_size = sub_size_list[i]
+			try:
+				local_dist_list = alpha_subsample_infodict[sampleID][subsample_size][dist_function_name]
+				m = np.median(local_dist_list)
+			except:
+				m = 'nan'
+			string_out += '\t'+str(m)
+		string_out += '\n'
+	outfile = open(output_dir+"subsample_regress."+dist_function_name+".n"+str(num_subsamples)+".txt",'w')
+	outfile.write(string_out)
+	outfile.close()
+
+alpha_div_outfile = open(output_dir+"all_barcode.alpha_diversity.txt","w")
+alpha_div_outfile.write("sampleID\tshannon_div\tsimpson_div\tchao_richness\tshannon_evenness\tobs_richness\n")
+for a in range(0,len(accession_list)):
+	sampleID = accession_list[a]
+	try:
+		sample_fit_dict = alpha_fit_dict[sampleID]
+	except:
+		sample_fit_dict = {}
+	if sample_fit_dict != {}:
+		H_shannon = sample_fit_dict['shannon']
+		H_simpson = sample_fit_dict['simpson']
+		E_shannon = sample_fit_dict['even']
+		R_chao = sample_fit_dict['chao']
+		R_rich = sample_fit_dict['rich']
+	else:
+		H_shannon,E_shannon = shannon_alpha(barcode_freq_dict_nosingleton[sampleID])
+		H_simpson = simpson_alpha(barcode_freq_dict_nosingleton[sampleID])
+		R_chao = chao_1_richness(barcode_count_dict_nosingleton[sampleID],2) #value of 2 to not count singletons
+		R_rich = true_richness(barcode_count_dict_nosingleton[sampleID],2) #value of 2 to not count singletons
+	alpha_div_outfile.write(sampleID+"\t"+str(H_shannon)+"\t"+str(H_simpson)+"\t"+str(R_chao)+"\t"+str(E_shannon)+"\t"+str(R_rich)+"\n")
 alpha_div_outfile.close()
 
-print("Calculating Bray-Curtis dissimilarity matrix")
-bray_outfile = open(output_dir+"all_barcode.bray-curtis_dissimilarity.txt","w")
-bray_curtis_dict = {}
-for j in range(0,len(accession_list)):
-	bray_outfile.write("\t"+accession_list[j])
-bray_outfile.write("\n")
-for i in range(0,len(accession_list)):
-	bray_outfile.write(accession_list[i])
-	for j in range(0,len(accession_list)):
-		if i == j:
-			dist = 0
-		else:
-			accession1 = accession_list[i]
-			accession2 = accession_list[j]
-			try:
-				dist = bray_curtis_dict[accession2][accession1]
-			except:
-				try:
-					dist = bray_curtis_dissimilarity(barcode_freq_dict[accession1],barcode_freq_dict[accession2])
-				except:
-					dist = 'na'
-				try:
-					bray_curtis_dict[accession1][accession2] = dist
-				except:
-					bray_curtis_dict[accession1] = {}
-					bray_curtis_dict[accession1][accession2] = dist
-		bray_outfile.write("\t"+str(dist))
-	bray_outfile.write("\n")
-bray_outfile.close()
 
-print("Calculating Jaccard dissimilarity matrix")
-jaccard_outfile = open(output_dir+"all_barcode.jaccard_dissimilarity.txt","w")
-jaccard_dict = {}
-for j in range(0,len(accession_list)):
-	jaccard_outfile.write("\t"+accession_list[j])
-jaccard_outfile.write("\n")
+print("Calculating beta-diversity dissimilarity indicies")
+all_process_inputs = []
 for i in range(0,len(accession_list)):
-	jaccard_outfile.write(accession_list[i])
+	sample1 = accession_list[i]
+	for j in range(i+1,len(accession_list)):
+		sample2 = accession_list[j]
+		count1 = barcode_count_dict[sample1]
+		count2 = barcode_count_dict[sample2]
+		process_tup = ((sample1,count1),(sample2,count2))
+		all_process_inputs.append(process_tup)
+processed_list = Parallel(n_jobs=num_cores)(delayed(subsample_beta_func)(process_tup,full_barcode_list,num_subsamples) for process_tup in all_process_inputs)
+
+sub_size_list = []
+beta_subsample_infodict = {}
+beta_fit_dict = {}
+for tup in processed_list:
+	s1 = tup[0]
+	s2 = tup[1]
+	beta_subsample_infodict[s1+s2] = tup[2]
+	beta_fit_dict[s1+s2] = tup[3]
+	local_sub_size_list = list(tup[2].keys())
+	if len(local_sub_size_list) > len(sub_size_list):
+		sub_size_list = sorted(local_sub_size_list)
+
+dist_function_name_list = ['bray','jaccard']
+for d in range(0,len(dist_function_name_list)):
+	dist_function_name = dist_function_name_list[d]
+	string_out = '\t'
+	for i in range(0,len(sub_size_list)):
+		subsample_size = sub_size_list[i]
+		string_out += '\t'+str(subsample_size)
+	string_out += '\n'
+	for p in range(0,len(accession_list)):
+		sample1 = accession_list[p]
+		for q in range(p,len(accession_list)):
+			sample2 = accession_list[q]
+			string_out += sample1+'\t'+sample2
+			for i in range(0,len(sub_size_list)):
+				subsample_size = sub_size_list[i]
+				try:
+					local_dist_list = beta_subsample_infodict[sample1+sample2][subsample_size][dist_function_name]
+				except:
+					try:
+						local_dist_list = beta_subsample_infodict[sample2+sample1][subsample_size][dist_function_name]
+					except:
+						local_dist_list = []
+				if len(local_dist_list)>0:
+					m = np.median(local_dist_list)
+				else:
+					m = 'nan'
+				string_out += '\t'+str(m)
+			string_out += '\n'
+	outfile = open(output_dir+"subsample_regress."+dist_function_name+".n"+str(num_subsamples)+".txt",'w')
+	outfile.write(string_out)
+	outfile.close()
+
+
+
+	bray_outfile = open(output_dir+"all_barcode.bray-curtis_dissimilarity.txt","w")
 	for j in range(0,len(accession_list)):
-		if i == j:
-			dist = 0
-		else:
+		bray_outfile.write("\t"+accession_list[j])
+	bray_outfile.write("\n")
+	for i in range(0,len(accession_list)):
+		bray_outfile.write(accession_list[i])
+		for j in range(0,len(accession_list)):
 			accession1 = accession_list[i]
 			accession2 = accession_list[j]
 			try:
-				dist = jaccard_dict[accession2][accession1]
+				dist = beta_fit_dict[accession1+accession2]['bray']
 			except:
 				try:
-					dist = jaccard_dissimilarity(barcode_freq_dict[accession1],barcode_freq_dict[accession2])
+					dist = beta_fit_dict[accession2+accession1]['bray']
 				except:
-					dist = "na"
-				try:
-					jaccard_dict[accession1][accession2] = dist
-				except:
-					jaccard_dict[accession1] = {}
-					jaccard_dict[accession1][accession2] = dist
-		jaccard_outfile.write("\t"+str(dist))
+					try:
+						dist = bray_curtis_dissimilarity(barcode_freq_dict_nosingleton[accession1],barcode_freq_dict_nosingleton[accession2])
+					except:
+						dist = 'nan'
+			bray_outfile.write("\t"+str(dist))
+		bray_outfile.write("\n")
+	bray_outfile.close()
+
+	jaccard_outfile = open(output_dir+"all_barcode.jaccard_dissimilarity.txt","w")
+	for j in range(0,len(accession_list)):
+		jaccard_outfile.write("\t"+accession_list[j])
 	jaccard_outfile.write("\n")
-jaccard_outfile.close()
+	for i in range(0,len(accession_list)):
+		jaccard_outfile.write(accession_list[i])
+		for j in range(0,len(accession_list)):
+			accession1 = accession_list[i]
+			accession2 = accession_list[j]
+			try:
+				dist = beta_fit_dict[accession1+accession2]['jaccard']
+			except:
+				try:
+					dist = beta_fit_dict[accession2+accession1]['jaccard']
+				except:
+					try:
+						dist = jaccard_dissimilarity(barcode_count_dict_nosingleton[accession1],barcode_count_dict_nosingleton[accession2],2) #value of 2 to exclude singletons
+					except:
+						dist = 'nan'
+			jaccard_outfile.write("\t"+str(dist))
+		jaccard_outfile.write("\n")
+	jaccard_outfile.close()
 
 
 ####################################### Plot stacked bar plots #######################################
@@ -1429,8 +2462,8 @@ if generate_stacked_bar_plots == True:
 		axs.set_yticks([0.0,0.25,0.5,0.75,1.0])
 	mismatch_axis = axs.twinx()
 	mismatch_axis.plot(max_mismatch_array,color='black',marker='o', markersize=3, mfc='grey',linestyle='None')#linewidth=0.5, 
-	mismatch_axis.set_ylim(0.0,1.05)
-	mismatch_axis.set_yticks([0.0,0.25,0.5,0.75,1.0])
+	mismatch_axis.set_ylim(0.0,0.55)
+	mismatch_axis.set_yticks([0.0,0.1,0.2,0.3,0.4,0.5])
 	mismatch_axis.set_ylabel("Max proportion of reads discarded")
 	plt.tight_layout()
 	if max_titer == 1.0:
