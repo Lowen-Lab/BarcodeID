@@ -19,7 +19,7 @@ in the appropriate terminal and following the text prompts for required informat
 * In this case, the script will automatically detect if sequence files are compressed (.tar, .tar.gz, or .gz), unzip them in parallel if necessary, then predict forward and reverse sequence pairs from any detectible sequence files (.fastq or .fq).
    * If the script is unable to predict the forward and reverse sequence file extensions (e.g. *"_R1.fastq"* and *"_R2.fastq"*), the script will ask the user to input them manually in the "User defined variables" section at the top of the script.
 * BarcodeID will then predict the barcoded sites within the amplicon library after the user indicates the number of barcodes that they expect to find in their library, using either a random or user-supplied sample. If the user verifies the prediction is correct through a text prompt, BarcodeID will immediately perform analysis on all remaining samples.
-   * In the event that BarcodeID is unable to detect the correct number of barcodes, or if the user indicates that they are incorrect based on their expectation, a file containing the predicted values will be generated called *"amplicon_info.auto.txt"*, which the user can use as a template to correct the error.
+   * In the event that BarcodeID is unable to detect the correct number of barcodes, or if the user indicates that the prediction doesn't match their expectation, a file containing the predicted values will be generated called *"amplicon_info.auto.txt"*, which the user can use as a template to correct the error.
 
 
 # How to install the dependencies of this script
@@ -27,8 +27,9 @@ in the appropriate terminal and following the text prompts for required informat
 The requirements to run this pipeline are:
 1. Python3
    * We recommend using [miniconda](https://docs.conda.io/en/latest/miniconda.html) to install python and the required packages
-2. [BBTools](https://jgi.doe.gov/data-and-tools/software-tools/bbtools/)
-   * Note that the bbtools available on anaconda is not currently a functional copy, so it needs to be downloaded from the JGI website linked above
+2. [BBTools](https://archive.jgi.doe.gov/data-and-tools/software-tools/bbtools/)
+   * For barcodeID to work properly, you need to add BBtools to your path
+   * Note that the version of bbtools that is available on anaconda is not functional, so it needs to be downloaded from the JGI website linked above
 3. Java (to run the BBTools)
 4. Bash (also required to run BBTools)
    * This is available by default on Mac and Linus operating systems
@@ -75,3 +76,5 @@ Output files are generated in the folder *"./barcode_info/"*
       * This table reports the jaccard dissimilarity between all samples (0 means identical, 1 means there is no overalp in barcodes. This metric only considers overlap in barcode presence between samples, not their frequency).
 
 The intermediate files generated for each sample are located in *"./barcode_info/samples/"*
+
+An optional output is a stacked bar plot of the barcodes from all samples. By default, the height of the bars will be scaled to 1.0, but if the user wants to scale the bar height to titer, they can create a file called "sample_titers.txt" that is tab separated, with one sample per line like this: sampleID -tab- titer.
