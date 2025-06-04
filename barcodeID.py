@@ -1,5 +1,5 @@
 '''
-barcoded amplicon processing pipeline - v1.2
+barcoded amplicon processing pipeline - v1.3
 ###################################################################################################
 #####################################    About this script    #####################################
 ###################################################################################################
@@ -16,15 +16,11 @@ possible nucleotides at barcode sites, (2) match all the expected nucleotide at 
 and (3) meet the base quality thresholds set by the user.
 
 Features of this pipeline:
- -	It automatically detect and process all fastq files in a specified directory without needing to
- 	explicitly list the filenames.
  -	Input sequences can be compressed or uncompressed .fastq files
- -	It has a parallel processing mode that takes advantace of multi-core processors.
- -	It has the option to consider base quality of barcode and non-barcode sites (a.k.a. backbone 
-	sites) separately.
+ -	It has a parallel processing mode that takes advantage of multi-core processors
  -	A key feature is that you may interrupt the script running at any time, then resume , and will not attempt
 	to redo steps that have already been completed, unless requested by the user.
-		- Safeguards are in place to prevent incompletely generated output files from being saved.
+		- Safeguards are in place to prevent incompletely generated output files from being saved
 		- Additional samples can be added to a folder at any time, and re-running BarcodeID will process
 		  only the additional samples, before generating combined outputs
  -	All information about reads discarded because they contain unexpected bases are saved in separate
@@ -66,6 +62,7 @@ correct, or enter the correct values. All remaining samples will then be process
 11/17/2023 - v1.0 - First publicly available version
 04/25/2024 - v1.1 - Added generation of stacked bar plot figures and improved file suffix prediction
 10/07/2024 - v1.2 - Added barcode quality correction and agglomeration (similar to DADA2 for 16S)
+06/04/2025 - v1.3 - Bug fixes and optimized quality correction runtime
 '''
 ###################################### Load required modules ######################################
 import os
@@ -105,8 +102,8 @@ generate_stacked_bar_plots = True #when True, stacked bar plots will be generate
 
 reads_already_screened_for_quality = False # 'True' or 'False' --- If reads were already merged and screened for average quality and length (such as during a demultiplexing step), the script will not attempt to filter or merge the input reads
 raw_read_input_type = "paired" # 'paired' or 'single' --- When 'single' the pipeline will look for barcodes in one file, when 'paired' the pipeline will look for forward and reverse reads. Single core use has not been extensively tested - recommend using "paired" and setting "parallel_max_cpu" to 1 if you only wish to use one core at a time
-forward_read_suffix = "_R1.fastq" #if empty, the script will attempt to predict these values, but it only works under specific assumptions
-reverse_read_suffix = "_R2.fastq" #this value is ignored if 'reads_already_screened_for_quality' is 'True' or 'raw_read_input_type' is 'single' - NOTE: this variable cannot be removed without causing missing value errors
+forward_read_suffix = "" #if empty, the script will attempt to predict these values, but it only works under specific assumptions
+reverse_read_suffix = "" #this value is ignored if 'reads_already_screened_for_quality' is 'True' or 'raw_read_input_type' is 'single' - NOTE: this variable cannot be removed without causing missing value errors
 
 parallel_process = True #'True' or 'False' --- when True, the script uses the joblib package to run multiple samples simultaneously. Currently not stable on windows
 parallel_max_cpu = 150 # when parallel process true, this sets the max CPUs the script is allowed to use. If you want to use all available, set to 0. If you want to use all but one, set to -1 (or -2 to use all but 2 CPUs)
@@ -124,7 +121,6 @@ def run_command(command,mode="quiet"):
 		return_code = os.system(command)
 	elif mode == "quiet":
 		return_code = os.system(command+" >/dev/null 2>&1")
-	# subprocess.check_output(command,stderr=subprocess.STDOUT)
 	if return_code == 0:
 		run_status = True
 	return run_status
@@ -135,23 +131,20 @@ def unzip_gz(filename,path_to_file):
 	if out == False:
 		sys.exit()
 	return filename
-
 def unzip_tar_gz(filename,path_to_file):
-	command = "tar -xvzf "+path_to_file+filename
+	command = "tar -xzf "+path_to_file+filename
 	out = run_command(command)
 	if out == False:
 		sys.exit()
 	return filename
-
 def zip_gz(filename,path_to_file):
 	command = "gzip -9 "+path_to_file+filename
 	out = run_command(command)
 	if out == False:
 		sys.exit()
 	return filename
-
 def zip_tar_gz(filename,path_to_file):
-	command = "tar -cvzf "+path_to_file+filename+".tar.gz "+path_to_file+filename
+	command = "tar -czf "+path_to_file+filename+".tar.gz "+path_to_file+filename
 	out = run_command(command)
 	if out == False:
 		sys.exit()
@@ -180,18 +173,22 @@ def check_if_input_zipped(input_dir,parallel_process,num_cores):
 	#Unzip any files that need unzipping
 	tar_gz_inputs = [f for f in os.listdir(input_dir) if f.endswith(".tar.gz")]
 	if len(tar_gz_inputs) > 0:  #unzip .tar.gz files
-		if parallel_process == True:
-			processed_list = Parallel(n_jobs=num_cores)(delayed(unzip_tar_gz)(i,input_dir) for i in tar_gz_inputs)
-		else:
-			for targzfile in tar_gz_inputs:
-				unzip_tar_gz(gzfile,input_dir)
+		unzip_files = input("Unzip '.tar.gz' files in input directory? (y/n)")
+		if unzip_files == "y" or unzip_files == "yes" or unzip_files == "Y":
+			if parallel_process == True:
+				processed_list = Parallel(n_jobs=num_cores)(delayed(unzip_tar_gz)(i,input_dir) for i in tar_gz_inputs)
+			else:
+				for targzfile in tar_gz_inputs:
+					unzip_tar_gz(gzfile,input_dir)
 	gz_inputs = [f for f in os.listdir(input_dir) if f.endswith(".gz")]
 	if len(gz_inputs) >0:  #unzip .gz files
-		if parallel_process == True:
-			processed_list = Parallel(n_jobs=num_cores)(delayed(unzip_gz)(i,input_dir) for i in gz_inputs)
-		else:
-			for gzfile in gz_inputs:
-				unzip_gz(gzfile,input_dir)
+		unzip_files = input("Unzip '.gz' files in input directory? (y/n)")
+		if unzip_files == "y" or unzip_files == "yes" or unzip_files == "Y":
+			if parallel_process == True:
+				processed_list = Parallel(n_jobs=num_cores)(delayed(unzip_gz)(i,input_dir) for i in gz_inputs)
+			else:
+				for gzfile in gz_inputs:
+					unzip_gz(gzfile,input_dir)
 	fq_inputs = [f for f in os.listdir(input_dir) if f.endswith(".fastq") or f.endswith(".fq")]
 	if len(fq_inputs) >0:
 		files_found = True
@@ -244,6 +241,7 @@ def predict_paired_file_extensions(input_dir):
 	if successful_prediction == False:
 		sys.exit('Unable to predict forward and reverse read suffix values. Enter manually in "user defined variables" section in BarcodeID script to proceed.\nExiting.')
 
+
 def predict_single_file_extension(input_dir):
 	exten_filelist = [f for f in os.listdir(input_dir) if f.endswith(".fastq") or f.endswith(".fq")]
 	shortest_filename = exten_filelist[0]
@@ -281,6 +279,7 @@ def predict_single_file_extension(input_dir):
 		return filename[last_monomorphic:]
 	if successful_prediction == False:
 		sys.exit("Unable to predict read suffix value. Enter manually to proceed.\nExiting.")
+
 
 def detect_barcode_content(seq_dict,amplicon_length):
 	amplicon_expect = ''
@@ -321,6 +320,9 @@ def detect_barcode_content(seq_dict,amplicon_length):
 	outfile.write(prop_lineout)
 	outfile.close()
 	
+	plot_minor_freq = []
+	plot_location = []
+	plot_color = []
 	amplicon_expect = "N"*amplicon_length
 	minor_freq_loc_list = sorted(minor_freq_loc_list,reverse=True)
 	med_freq = np.median(minor_freq_list)
@@ -328,12 +330,22 @@ def detect_barcode_content(seq_dict,amplicon_length):
 		local_freq = minor_freq_loc_list[i][0]
 		loc = minor_freq_loc_list[i][1]
 		allele_tup = minor_freq_loc_list[i][2]
-		if (local_freq/med_freq)>=10 and local_freq >= 0.03:
+		amplicon_expect = amplicon_expect[0:loc]+allele_tup[0]+amplicon_expect[loc+1:amplicon_length]
+		if (local_freq/med_freq)>=9 and local_freq >= 0.03:
 			barcode_sites[loc] = [allele_tup[0],allele_tup[1]]
-			# amplicon_expect += "N"
+			plot_color.append('crimson')
 		else:
-			amplicon_expect = amplicon_expect[0:loc]+allele_tup[0]+amplicon_expect[loc+1:amplicon_length]
-			# amplicon_expect[loc] = allele_tup[0]
+			plot_color.append('dodgerblue')
+		plot_minor_freq.append(local_freq)
+		plot_location.append(loc)
+
+	fig,ax = plt.subplots()
+	plt.scatter(plot_location,plot_minor_freq,s=8,c=plot_color)
+	ax.set_ylim(0.0,0.55)
+	ax.set_yticks([0.0,0.1,0.2,0.3,0.4,0.5])
+	ax.set_ylabel("Frequency of minor allele")
+	ax.set_xlabel("Location in amplicon")
+	plt.savefig(project_dir+"barcode_predict.minor_allele_freq.pdf")
 	return amplicon_expect, barcode_sites
 
 
@@ -1156,7 +1168,7 @@ def abundance_pval(intup_i, intup_j): #i is the focal barcode, j is the higher a
 		pA = float(round_to_n_sig_figs(pA,4))
 	return pA
 
-def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,max_hamming_dist=3):
+def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-50,max_hamming_dist=2):
 	new_seed_counter = 0
 	ranked_barcode_list = sorted(input_barcode_list,reverse=True)
 	partition_dict = {}
@@ -1197,6 +1209,8 @@ def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,
 	active_ranked_barcode_list = sorted(active_ranked_barcode_list,reverse=True)
 
 	#Find subsequent valid barcodes and initiate seeds
+	hamming_dist_dict = {}
+	abundance_pval_dict = {}
 	if len(active_ranked_barcode_list)==0:
 		return partition_count_dict
 	still_iterating = True
@@ -1214,28 +1228,44 @@ def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,
 				query_Qsum = query_tup[2]
 				query_B = query_tup[3]
 				query_Q = query_tup[4]
-				valid_barcodeID = False
-				try:
-					full_barcode_dict[query_B]
-					valid_barcodeID = True
-				except:
-					pass
-				consolodated_barcodeID = False
-				try:
-					consolodated_dict[query_tup]
-					consolodated_barcodeID= True
-				except:
-					pass
-				if valid_barcodeID == True and query_C > 1 and consolodated_barcodeID == False:
+				valid_barcodeID = True#False
+				# try:
+				# 	full_barcode_dict[query_B]
+				# 	valid_barcodeID = True
+				# except:
+				# 	pass
+				# consolodated_barcodeID = False
+				# try:
+				# 	consolodated_dict[query_tup]
+				# 	consolodated_barcodeID= True
+				# except:
+				# 	pass
+				if query_C > 1:#and valid_barcodeID == True and consolodated_barcodeID == False:
 					query_pA_list = []
 					for b in range(0,len(seed_barcode_list)):
 						seed_B = seed_barcode_list[b]
 						seed_C = partition_count_dict[seed_B]
 						seed_tup = (seed_B,seed_C)
 						if seed_B != query_B:
-							hdist = cal_hamming_dist(query_B,seed_B)
+							try:
+								hdist = hamming_dist_dict[query_B][seed_B]
+							except:
+								hdist = cal_hamming_dist(query_B,seed_B)
+								try:
+									hamming_dist_dict[query_B][seed_B] = hdist
+								except:
+									hamming_dist_dict[query_B] = {}
+									hamming_dist_dict[query_B][seed_B] = hdist
 							if seed_C > query_C and hdist <= max_hamming_dist:
-								pA = abundance_pval(query_tup, seed_tup)
+								try:
+									pA = abundance_pval_dict[query_tup][seed_tup]
+								except:
+									pA = abundance_pval(query_tup, seed_tup)
+									try:
+										abundance_pval_dict[query_tup][seed_tup] = pA
+									except:
+										abundance_pval_dict[query_tup] = {}
+										abundance_pval_dict[query_tup][seed_tup] = pA
 							else:
 								pA = 0.0
 							dist_val = 1.0/hdist
@@ -1246,7 +1276,15 @@ def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,
 					min_tup = query_pA_list[0]
 					min_pA = min_tup[0]
 					min_seed_B = min_tup[3]
-					min_hdist = cal_hamming_dist(query_B,min_seed_B)
+					try:
+						min_hdist = hamming_dist_dict[query_B][min_seed_B]
+					except:
+						min_hdist = cal_hamming_dist(query_B,min_seed_B)
+						try:
+							hamming_dist_dict[query_B][min_seed_B] = min_hdist
+						except:
+							hamming_dist_dict[query_B] = {}
+							hamming_dist_dict[query_B][min_seed_B] = min_hdist
 					min_seed_C = partition_count_dict[min_seed_B]
 					temp_tup = (min_pA,1.0/query_C,1.0/min_hdist,1.0/min_seed_C,min_seed_B,query_tup)
 					pA_rank_list.append(temp_tup)
@@ -1258,17 +1296,18 @@ def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,
 			max_query_B = max_query_tup[3]
 			max_query_C = max_query_tup[0]
 			max_query_Q = max_query_tup[4]
-			valid_query_barcodeID = False
-			try:
-				full_barcode_dict[max_query_B]
-				valid_query_barcodeID = True
-			except:
-				pass
+			# valid_query_barcodeID = False
+			# try:
+			# 	full_barcode_dict[max_query_B]
+			# 	valid_query_barcodeID = True
+			# except:
+			# 	pass
 			new_active_ranked_barcode_list = []
-			if max_query_C > 1 and max_query_pA<=minimum_pA_threshold and valid_query_barcodeID == True:
+			if max_query_C > 1 and max_query_pA<=minimum_pA_threshold:# and valid_query_barcodeID == True:
 				partition_dict[max_query_B] = [max_query_tup]
 				partition_count_dict[max_query_B] = max_query_C
 				consolodated_dict[max_query_tup] = 'new-seed'
+				abundance_pval_dict[max_query_tup] = {}
 				new_seed_B = max_query_B
 				new_seed_counter += 1
 				for b in range(0,len(active_ranked_barcode_list)):
@@ -1281,13 +1320,14 @@ def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,
 					consolodated_query_barcodeID = False
 					try:
 						consolodated_dict[query_tup]
-						consolodated_query_barcodeIDb = True
+						consolodated_query_barcodeID = True
 					except:
 						pass
 					if query_B == new_seed_B and query_tup != max_query_tup and consolodated_query_barcodeID == False:
 						partition_dict[query_B].append(query_tup)
 						partition_count_dict[query_B] += query_C
 						consolodated_dict[query_tup] = 'new-seed-collapse'
+						abundance_pval_dict[query_tup] = {}
 					elif query_B != new_seed_B:
 						new_active_ranked_barcode_list.append(query_tup)
 			else:
@@ -1308,81 +1348,105 @@ def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-40,
 				consolodated_dict[query_tup]
 			except:
 				active_ranked_barcode_list.append(query_tup)
-	active_ranked_barcode_list = list(set(active_ranked_barcode_list))
-	active_ranked_barcode_list = sorted(active_ranked_barcode_list,reverse=True)
+	# active_ranked_barcode_list = list(set(active_ranked_barcode_list))
+	# active_ranked_barcode_list = sorted(active_ranked_barcode_list,reverse=True)
 
 	#agglomerate remaining valid barcodes
+	abundance_pval_dict = {}
 	seed_barcode_list = list(partition_dict.keys())
-	minimum_pA_threshold = pval_thresh/(float(len(active_ranked_barcode_list)))#*len(seed_barcode_list))
-	for i in range(0,len(active_ranked_barcode_list)):
-		query_tup = active_ranked_barcode_list[i]
-		query_C = query_tup[0]
-		query_Qsum = query_tup[2]
-		query_B = query_tup[3]
-		query_Q = query_tup[4]
-		try:
-			full_barcode_dict[query_B]
-		except:
-			pass
-		consolodated_barcodeID = False
-		try:
-			consolodated_dict[query_tup]
-			consolodated_barcodeID = True
-		except:
-			pass
-		valid_barcodeID = False
-		try:
-			full_barcode_dict[query_B]
-			valid_barcodeID = True
-		except:
-			pass
-		if consolodated_barcodeID == False:
-			query_pA_list = []
-			for b in range(0,len(seed_barcode_list)):
-				seed_B = seed_barcode_list[b]
-				seed_C = partition_count_dict[seed_B]
-				seed_tup = (seed_B,seed_C)#partition_dict[seed_B][0]
-				hdist = cal_hamming_dist(query_B,seed_B)
-				if seed_B != query_B:
-					if query_C < seed_C and hdist <= max_hamming_dist:
-						pA = abundance_pval(query_tup, seed_tup)
-					else:
-						pA = 0.0
-					temp_tup = (pA,1.0/hdist,0,seed_B)
-					query_pA_list.append(temp_tup)
-			if len(query_pA_list) >= 1:
-				query_pA_list = sorted(query_pA_list,reverse=True)
-				min_tup = query_pA_list[0]
-				min_pA = min_tup[0]
-				min_seed_B = min_tup[3]
-				min_hdist = cal_hamming_dist(query_B,min_seed_B)
-				min_seed_C = partition_count_dict[min_seed_B]
-				minimum_pA_threshold = pval_thresh/(float(len(seed_barcode_list)))
-				if min_pA>=minimum_pA_threshold and query_C > 1 and min_hdist <= max_hamming_dist:
-					partition_dict[min_seed_B].append(query_tup)
-					count_before = partition_count_dict[min_seed_B]
-					partition_count_dict[min_seed_B] += query_C
-					consolodated_dict[query_tup] = 'seed-collapse'
+	try:
+		minimum_pA_threshold = pval_thresh/(float(len(active_ranked_barcode_list)))
+	except:
+		minimum_pA_threshold = 1.
+	if len(active_ranked_barcode_list)>0:
+		for i in range(0,len(active_ranked_barcode_list)):
+			query_tup = active_ranked_barcode_list[i]
+			query_C = query_tup[0]
+			query_Qsum = query_tup[2]
+			query_B = query_tup[3]
+			query_Q = query_tup[4]
+			try:
+				full_barcode_dict[query_B]
+			except:
+				pass
+			consolodated_barcodeID = False
+			try:
+				consolodated_dict[query_tup]
+				consolodated_barcodeID = True
+			except:
+				pass
+			valid_barcodeID = False
+			try:
+				full_barcode_dict[query_B]
+				valid_barcodeID = True
+			except:
+				pass
+			if consolodated_barcodeID == False:
+				query_pA_list = []
+				for b in range(0,len(seed_barcode_list)):
+					seed_B = seed_barcode_list[b]
+					seed_C = partition_count_dict[seed_B]
+					seed_tup = (seed_B,seed_C)#partition_dict[seed_B][0]
+					hdist = cal_hamming_dist(query_B,seed_B)
+					try:
+						hdist = hamming_dist_dict[query_B][seed_B]
+					except:
+						hdist = cal_hamming_dist(query_B,seed_B)
+						try:
+							hamming_dist_dict[query_B][seed_B] = hdist
+						except:
+							hamming_dist_dict[query_B] = {}
+							hamming_dist_dict[query_B][seed_B] = hdist
+					if seed_B != query_B:
+						if query_C < seed_C and hdist <= max_hamming_dist:
+							# pA = abundance_pval(query_tup, seed_tup)
+							try:
+								pA = abundance_pval_dict[query_tup][seed_tup]
+							except:
+								pA = abundance_pval(query_tup, seed_tup)
+								try:
+									abundance_pval_dict[query_tup][seed_tup] = pA
+								except:
+									abundance_pval_dict[query_tup] = {}
+									abundance_pval_dict[query_tup][seed_tup] = pA
+						else:
+							pA = 0.0
+						temp_tup = (pA,1.0/hdist,0,seed_B)
+						query_pA_list.append(temp_tup)
+				if len(query_pA_list) >= 1:
+					query_pA_list = sorted(query_pA_list,reverse=True)
+					min_tup = query_pA_list[0]
+					min_pA = min_tup[0]
+					min_seed_B = min_tup[3]
+					min_hdist = cal_hamming_dist(query_B,min_seed_B)
+					min_seed_C = partition_count_dict[min_seed_B]
+					minimum_pA_threshold = pval_thresh/(float(len(seed_barcode_list)))
+					if min_pA>=minimum_pA_threshold and query_C > 1 and min_hdist <= max_hamming_dist:
+						partition_dict[min_seed_B].append(query_tup)
+						count_before = partition_count_dict[min_seed_B]
+						partition_count_dict[min_seed_B] += query_C
+						consolodated_dict[query_tup] = 'seed-collapse'
+						abundance_pval_dict[query_tup] = {}
+					elif valid_barcodeID == True:
+						try:
+							partition_dict[query_B].append(query_tup)
+							count_before = partition_count_dict[query_B]
+							partition_count_dict[query_B] += query_C
+							consolodated_dict[query_tup] = 'remain-add'
+						except:
+							partition_dict[query_B] = [query_tup]
+							partition_count_dict[query_B] = query_C
+							consolodated_dict[query_tup] = 'remain'
 				elif valid_barcodeID == True:
 					try:
 						partition_dict[query_B].append(query_tup)
 						count_before = partition_count_dict[query_B]
 						partition_count_dict[query_B] += query_C
-						consolodated_dict[query_tup] = 'remain-add'
+						consolodated_dict[query_tup] = 'last-add'
 					except:
 						partition_dict[query_B] = [query_tup]
 						partition_count_dict[query_B] = query_C
-						consolodated_dict[query_tup] = 'remain'
-			elif valid_barcodeID == True:
-				try:
-					partition_dict[query_B].append(query_tup)
-					count_before = partition_count_dict[query_B]
-					partition_count_dict[query_B] += query_C
-					consolodated_dict[query_tup] = 'last-add'
-				except:
-					partition_dict[query_B] = [query_tup]
-					partition_count_dict[query_B] = query_C
-					consolodated_dict[query_tup] = 'last'
+						consolodated_dict[query_tup] = 'last'
 	return partition_count_dict
 
 def raw_read_processing_single(accession,command_prefix,raw_reads_forward,trim_dir,temp_dir,detect_barcode_content_first,amplicon_length,force_trim_pre_merge,truncate_length_post_merge):
@@ -1437,7 +1501,8 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 	pretrim_fastq_filename = temp_dir+accession+".merge_pretrim.fq"
 	merged_trimmed_filename = temp_dir+accession+".merge.fq"
 	clean_filename_out = trim_dir+accession+".fq"
-
+	if os.path.isfile(raw_reads_forward) == False or os.path.isfile(raw_reads_reverse) == False:
+		sys.exit('Unable to find paired files for sample: '+accession)
 	if detect_barcode_content_first == True or amplicon_length == 0:
 		median_forward_read_len = calc_expect_read_len(raw_reads_forward)
 		median_reverse_read_len = calc_expect_read_len(raw_reads_reverse)
@@ -1449,7 +1514,9 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 	command = command_prefix+'repair.sh in="'+raw_reads_forward+'" in2="'+raw_reads_reverse+'" out="'+repair_fastq_filename+'" fint=t repair=t threads=1 overwrite=t -da -Xmx1000m'
 	out = run_command(command)
 	if out == False:
-		sys.exit("repair.sh failed: "+accession)
+		print("repair.sh failed: "+accession)
+		run_command(command,'verbose')
+		sys.exit()
 	time.sleep(1)
 
 	len_diff_buffer = 50
@@ -1458,7 +1525,9 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 		command += " forcetrimleft="+str(force_trim_pre_merge)#+" forcetrimright=130"
 	out = run_command(command+" threads=1 -Xmx2000m")
 	if out == False:
-		sys.exit("bbmerge.sh adapter screen failed: "+accession)
+		print("bbmerge.sh adapter screen failed: "+accession)
+		run_command(command,'verbose')
+		sys.exit()
 	time.sleep(1)
 
 	adapter_pass = check_adapter(temp_adapter_filename)
@@ -1468,7 +1537,9 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 			command += " forcetrimleft="+str(force_trim_pre_merge)#+" forcetrimright=130"
 		out = run_command(command+" overwrite=t threads=1 -Xmx2000m")
 		if out == False:
-			sys.exit("bbmerge.sh merge with adapter trim failed: "+accession)
+			print("bbmerge.sh merge with adapter trim failed: "+accession)
+			run_command(command,'verbose')
+			sys.exit()
 		time.sleep(1)
 	else:
 		command = command_prefix+'bbmerge.sh in="'+repair_fastq_filename+'" out="'+pretrim_fastq_filename+'" qin=33 mix=f minlength='+str(read_len_expected-(len_diff_buffer+diff_median_len))+' maxlength='+str(read_len_expected+(len_diff_buffer+diff_median_len))+' overwrite=t' #forcetrimleft=9 
@@ -1476,7 +1547,9 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 			command += " forcetrimleft="+str(force_trim_pre_merge)#+" forcetrimright=130"
 		out = run_command(command+" overwrite=t threads=1 -Xmx2000m")
 		if out == False:
-			sys.exit("bbmerge.sh merge failed")
+			print("bbmerge.sh merge failed")
+			run_command(command,'verbose')
+			sys.exit()
 		time.sleep(1)
 
 	if amplicon_length == 0:
@@ -1486,7 +1559,9 @@ def raw_read_processing_paired(accession,command_prefix,raw_reads_forward,raw_re
 	command = command_prefix+'bbduk.sh in="'+pretrim_fastq_filename+'" out="'+merged_trimmed_filename+'" qin=33 maq=20 minlength='+str(median_merged_len)+' maxlength='+str(median_merged_len)+' tpe=f tbo=f'
 	out = run_command(command+ ' overwrite=t threads=1 -Xmx1000m')
 	if out == False:
-		sys.exit("bbduk.sh failed: "+accession)
+		print("bbduk.sh failed: "+accession)
+		run_command(command,'verbose')
+		sys.exit()
 	time.sleep(1)
 
 	if truncate_length_post_merge > 0:
@@ -1848,13 +1923,19 @@ file_list = [f for f in os.listdir(input_read_dir) if f.endswith(forward_read_su
 # 		file_list = [f for f in os.listdir(input_read_dir) if f.endswith(forward_read_suffix+".tar.gz")]
 
 accession_list = []
+files_not_accounted_for = 0
 for files in file_list:
 	accession = files.split(forward_read_suffix)[0]
 	accession_list.append(accession)
+	if raw_read_input_type == "paired":
+		rev_filepath = input_read_dir+accession+reverse_read_suffix
+		if os.path.isfile(rev_filepath)==False:
+			print("Reverse file not found: "+accession+reverse_read_suffix)
+			files_not_accounted_for += 1
+if files_not_accounted_for > 0:
+	sys.exit('Unable to find '+str(files_not_accounted_for)+' reverse files. Exiting.')
 accession_list = list(set(accession_list))
-	# if accession != 'KH50_02':
 
-# accession_list = []
 
 sorted_accession_list = sorted(accession_list)
 print_line_dict = {}
@@ -1880,7 +1961,12 @@ if detect_barcode_content_first == True:
 	if it correctly identified the barcode sites. If you agree with the prediction, remove ".auto" from
 	the "barcode.info.auto.txt" file that was generated, then re-run the script to process all remaining samples.'''
 	overwrite_existing_files = True
-	accession_entered = input('Enter sample name for predicting barcode info (or "random" to pick random sample):\n')
+	if len(accession_list)==1:
+		accession_entered = accession_list[0]
+		print("Only one file found, using: "+str(accession_entered)+" to predict barcode info")
+	else:
+		print(str(accession_list).replace(', ',' '))
+		accession_entered = input('Enter sample name for predicting barcode info (or "random" to pick random sample):\n')
 	temp_cont = False
 	if accession_entered == "random":
 		accession = accession_list[random.randint(0,len(accession_list))]
@@ -2407,11 +2493,11 @@ if generate_stacked_bar_plots == True:
 	bars_per_row = len(accession_list)
 	width_per_bar = 0.4
 	num_col = 1
-	num_row = 1#math.ceil(len(accession_list)/bars_per_row)
+	num_row = 1
 
-
+	page_width = max(2.,num_col*(width_per_bar*bars_per_row))
 	fig, axs = plt.subplots(num_row, num_col,sharex=True, sharey=True)##num_row, 
-	fig.set_size_inches(num_col*(width_per_bar*bars_per_row), num_row*7)
+	fig.set_size_inches(page_width, num_row*7)
 
 
 	plot_freq_array = []
