@@ -464,7 +464,7 @@ def fastq_to_fasta(filename_in,filename_out):
 	outfile.close()
 	return filename_out
 
-def pull_qual_info(input_seq_filename,max_read_count=1e6,min_qual_count=20):
+def pull_qual_info(input_seq_filename,max_read_count=1e9,min_qual_count=20):
 	flank_ignore = 0
 	infile = open(input_seq_filename,"r")
 	line_counter = -1
@@ -1168,7 +1168,7 @@ def abundance_pval(intup_i, intup_j): #i is the focal barcode, j is the higher a
 		pA = float(round_to_n_sig_figs(pA,4))
 	return pA
 
-def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-50,max_hamming_dist=2):
+def divisive_partition(input_barcode_list, full_barcode_dict, pval_thresh=1e-50,max_hamming_dist=3):
 	new_seed_counter = 0
 	ranked_barcode_list = sorted(input_barcode_list,reverse=True)
 	partition_dict = {}
@@ -1594,7 +1594,7 @@ def subsample_read_counts(barcode_qual_count_dict_in,subsample_count):
 	return barcode_qual_count_dict_out
 
 def barcode_screen_trimmed_reads(accession,sequence_filename,expected_amplicon_seq,barcode_sites,min_Q_score,temp_dir,output_dir,F_edge_ignore,R_edge_ignore):
-	reads_per_sample_ceiling = 1e5
+	reads_per_sample_ceiling = 1e9
 	### Load in processed reads and collect sequence to quality info to screen for barcodes
 	global verbose
 	if verbose == True:
